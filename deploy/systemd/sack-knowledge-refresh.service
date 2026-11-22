@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh the local knowledge database
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPOSITORY@
+ExecStart=@PYTHON@ -m sack_knowledge refresh
+UMask=0077

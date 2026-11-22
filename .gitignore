@@ -1,2 +1,7 @@
 # Private to this machine: settings, originals, database files, environment notes.
 /local/
+/.venv/
+__pycache__/
+/.pytest_cache/
+*.egg-info/
+/build/
