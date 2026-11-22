@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up the local knowledge database daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

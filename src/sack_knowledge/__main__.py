@@ -27,6 +27,11 @@ def main():
             command.add_argument(f"--{field}")
     commands.add_parser("mcp")
     commands.add_parser("embed")
+    commands.add_parser("refresh")
+    backup_command = commands.add_parser("backup")
+    backup_mode = backup_command.add_mutually_exclusive_group()
+    backup_mode.add_argument("--init", action="store_const", const="init", dest="mode")
+    backup_mode.add_argument("--verify", action="store_const", const="verify", dest="mode")
     commands.add_parser("eval").add_argument("questions", nargs="?", default="local/questions.jsonl")
     sync_command = commands.add_parser("sync")
     sync_command.add_argument("source", choices=("discord",))
@@ -46,6 +51,14 @@ def main():
             from .embedding import embed
 
             result = embed(config)
+        elif command == "refresh":
+            from .refresh import refresh
+
+            result = refresh(config)
+        elif command == "backup":
+            from .backup import backup
+
+            result = backup(config, mode=options["mode"] or "backup")
         elif command == "eval":
             from .evaluation import evaluate, table
 
@@ -58,6 +71,10 @@ def main():
             result = getattr(Query(config), command)(**options)
         print(encode(result))
         if command == "sync" and result["deletions_held"]:
+            return 1
+        if command == "refresh" and result["status"] == "failed":
+            return 1
+        if command == "backup" and result.get("matches_live") is False:
             return 1
     except LocalCommandError as error:
         print(f"{command} failed: {error}", file=sys.stderr)

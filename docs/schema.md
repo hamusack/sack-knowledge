@@ -85,3 +85,7 @@ rejects the report if another connection writes to the database while evaluation
 runs. The monitor is conservative and can reject a run after a no-change sync.
 P95 uses the nearest-rank percentile. Character counts use the capped
 response payload.
+
+Scheduled refresh uses a local nonblocking lock. The sync state entry for
+`refresh` records only a phase and exception type on failure. Deletion holds
+remain in the per-source sync state and do not fail the refresh process.

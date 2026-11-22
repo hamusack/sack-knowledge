@@ -28,6 +28,10 @@ word_index = false
 # JSONL under local/: {"question": "...", "answers": ["r:1", "c:2"], "filters": {"source": "discord"}}
 # Filters may contain start, end, person, project or source.
 
+[backup]
+mount_point = "/path/to/mounted/filesystem"
+repository = "/path/to/mounted/filesystem/<repository-directory>"
+
 [limits]
 search = 2000
 get = 6000
