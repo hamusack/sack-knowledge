@@ -7,6 +7,9 @@ from functools import wraps
 from pathlib import Path
 from time import perf_counter
 
+from .embedding import LocalEmbedder
+from .ranking import cosine_rank, fuse, vector_rows
+
 
 def encode(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -96,12 +99,12 @@ def query_tool(function: Callable):
     return run
 
 
-def search_page(rows, cap, total, position):
+def search_page(rows, cap, total, position, metadata=None):
     def page(items):
         next_position = position + len(items)
         has_more = bool(items) and next_position < total
         return {"items": items, "has_more": has_more, "total": total,
-                "next_position": next_position if has_more else None}
+                "next_position": next_position if has_more else None} | (metadata or {})
 
     items = []
     for row in rows:
@@ -114,6 +117,9 @@ def search_page(rows, cap, total, position):
             date = row["datetime"].replace("+00:00", "Z").replace(".000000Z", "Z")
             minimal = {"id": row["id"], "datetime": date, "excerpt": ""}
             result = page([minimal])
+            if len(encode(result)) > cap:
+                # A fallback marker can require the more compact epoch-millisecond representation.
+                minimal["datetime"] = int(datetime.fromisoformat(date).timestamp() * 1000)
             shorten(result, minimal, "excerpt", row["excerpt"], cap)
             return result
     return page(items)
@@ -164,8 +170,52 @@ def bounded(rows, cap, *, total=None, position=None):
     return result
 
 
+def lexical_rows(db, where, params, query, *, word=False):
+    joins = ""
+    match = ""
+    score = "0.0"
+    if word:
+        from .evaluation import segment
+
+        tokens = segment(query)
+        if not tokens:
+            return {}
+        joins = """JOIN words ON words.rowid=r.id
+                   JOIN word_fingerprints w ON w.id=r.id AND w.fingerprint=r.fingerprint"""
+        score = "words.rank"
+        cte = "WITH words AS MATERIALIZED (SELECT rowid, rank FROM word_fts WHERE word_fts MATCH ?) "
+        params = ['"' + tokens.replace('"', '""') + '"', *params]
+    elif len(query) >= 3 and "\x00" not in query:
+        joins = "JOIN words ON words.rowid=c.id"
+        score = "words.rank"
+        cte = "WITH words AS MATERIALIZED (SELECT rowid, rank FROM chunk_fts WHERE chunk_fts MATCH ?) "
+        match = " AND contains_text(r.body, ?)"
+        params = ['"' + query.replace('"', '""') + '"', *params, query]
+    else:
+        cte = "WITH "
+        if query:
+            match = " AND r.body LIKE ? ESCAPE '!'"
+            params = [*params, literal_like(query)]
+    separator = ", " if joins else ""
+    rows = db.execute(cte + separator + f"""
+        eligible AS (
+            SELECT c.id AS chunk, r.id AS record, r.created_at,
+                   {score} AS score,
+                   row_number() OVER (PARTITION BY c.id ORDER BY {score}, r.created_at, r.id) AS ordinal
+            FROM records r JOIN chunk_records cr ON cr.record_id=r.id
+            JOIN chunks c ON c.id=cr.chunk_id {joins}
+            WHERE {where}{match}
+        )
+        SELECT chunk, record FROM eligible WHERE ordinal=1
+        ORDER BY score, created_at DESC, chunk DESC
+    """, params)
+    return dict(rows)
+
+
 class Query:
-    def __init__(self, config):
+    def __init__(self, config, embedder=None):
+        self.config = config
+        self.embedder = embedder if embedder is not None else LocalEmbedder(config)
         self.database = Path(config["storage"]["database"])
         self.log = Path(config["storage"]["query_log"])
         if self.log.resolve() == self.database.resolve() or (
@@ -179,32 +229,36 @@ class Query:
 
     @query_tool
     def search(self, db, query="", start=None, end=None, person=None, project=None, source=None,
-               target="summary", position=0):
+               target=None, position=0, mode=None, *, _ranked=None):
+        if target is None:
+            target = "summary" if mode is None else "body"
         if target not in ("summary", "body") or not 0 <= position < 2**63:
             raise ValueError("Invalid search target or position")
+        if mode not in (None, "fts", "vector", "hybrid", "word") or (mode == "word" and _ranked is None):
+            raise ValueError("Invalid search mode")
         where, params = filters(start, end, person, project, source)
+        metadata = {}
         if target == "body":
-            match = ""
-            if len(query) >= 3 and "\x00" not in query:
-                match = """ AND c.id IN (SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH ?)
-                            AND contains_text(r.body, ?)"""
-                params.extend(('"' + query.replace('"', '""') + '"', query))
-            elif query:
-                match = " AND r.body LIKE ? ESCAPE '!'"
-                params.append(literal_like(query))
-            selection = f"""
-                WITH eligible AS (
-                    SELECT c.id AS chunk, r.id AS record,
-                           row_number() OVER (PARTITION BY c.id ORDER BY r.created_at, r.id) AS rank
-                    FROM records r JOIN chunk_records cr ON cr.record_id=r.id
-                    JOIN chunks c ON c.id=cr.chunk_id WHERE {where}{match}
-                )
-                SELECT 'c:' || c.id AS id, r.created_at AS datetime, r.source, r.original_ref,
-                       r.title, {SENDER}, r.body AS body
-                FROM eligible e JOIN chunks c ON c.id=e.chunk JOIN records r ON r.id=e.record
-                WHERE e.rank=1
-            """
+            if mode in ("vector", "hybrid"):
+                eligible = vector_rows(db, self.config, where, params)
+                ranked = cosine_rank(eligible, self.embedder, query) if eligible and query.strip() else {}
+                if eligible is None or not query.strip() or (eligible and not ranked):
+                    metadata["fallback"] = "fts"
+                    mode = "fts"
+            if mode != "vector":
+                lexical = lexical_rows(db, where, params, query, word=mode == "word")
+                ranked = fuse(lexical, ranked) if mode == "hybrid" else lexical
+            total = len(ranked)
+            ordered = list(ranked.items())[position:position + 10]
+            rows = []
+            for chunk, record in ordered:
+                rows.append(db.execute(f"""
+                    SELECT 'c:' || ? AS id, r.created_at AS datetime, r.source, r.original_ref,
+                           r.title, {SENDER}, r.body FROM records r WHERE r.id=?
+                """, (chunk, record)).fetchone())
         else:
+            if mode in ("vector", "hybrid"):
+                metadata["fallback"] = "fts"
             selection = f"""
                 WITH matching AS (
                     SELECT target_id, body, row_number() OVER (
@@ -219,15 +273,17 @@ class Query:
                 WHERE item.rank=1 AND {where}
             """
             params.insert(0, literal_like(query))
-        total = db.execute(f"SELECT count(*) FROM ({selection})", params).fetchone()[0]
-        rows = db.execute(selection + " ORDER BY datetime DESC, id DESC, body LIMIT 10 OFFSET ?",
-                          [*params, position])
+            total = db.execute(f"SELECT count(*) FROM ({selection})", params).fetchone()[0]
+            rows = db.execute(selection + " ORDER BY datetime DESC, id DESC, body LIMIT 10 OFFSET ?",
+                              [*params, position])
         items = []
         for row in rows:
             item = dict(row)
             item["excerpt"] = excerpt(item.pop("body"), query)
             items.append(item)
-        return bounded(items, self.limits["search"], total=total, position=position)
+        if _ranked is not None:
+            _ranked(db, [item["id"] for item in items])
+        return search_page(items, self.limits["search"], total, position, metadata)
 
     @query_tool
     def get(self, db, ids, neighbors=0):

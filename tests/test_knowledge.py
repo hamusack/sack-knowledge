@@ -3,13 +3,26 @@ import json
 import sqlite3
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from sack_knowledge.mcp_server import server
-from sack_knowledge.query import Query, bounded, encode, open_readonly
+from sack_knowledge.embedding import embed
+from sack_knowledge.evaluation import evaluate, table
+from sack_knowledge.query import Query, bounded, encode, open_readonly, search_page
 from sack_knowledge.sync import sync
+
+
+class FakeEmbedder:
+    def __init__(self):
+        self.batches = []
+
+    def encode(self, texts, *, query=False):
+        self.batches.extend(texts)
+        return [[1, 0] if query or "電力" in text else [1, 1] if "衛星" in text else [0, 1]
+                for text in texts]
 
 
 class Source:
@@ -351,6 +364,116 @@ def test_mcp_errors_never_echo_tool_arguments(setup):
                 assert [block.text for block in result.content] == ["Tool call failed."]
 
     asyncio.run(call_invalid_tools())
+
+
+def test_embedding_incremental_edit_deletion_and_model_change(setup):
+    config, source = setup
+    source.add("1", 0, "fixture")
+    source.add("2", 10, "fixture")
+    source.add("3", 20, "fixture")
+    sync(config, source.open)
+    model = FakeEmbedder()
+    assert embed(config, model)["embedded"] == 3
+    model.batches.clear()
+    assert embed(config, model)["embedded"] == 0 and model.batches == []
+    source.rows["1"]["body"] = "changed fixture"
+    del source.rows["2"]
+    sync(config, source.open)
+    assert embed(config, model)["embedded"] == 1
+    assert len(model.batches) == 1
+    with closing(open_readonly(config["storage"]["database"])) as db:
+        assert db.execute("SELECT count(*) FROM chunks WHERE embedding_dimension=2").fetchone()[0] == 2
+    config["embedding"] = {"model": "fixture-other"}
+    assert embed(config, model)["embedded"] == 2
+    assert embed(config, model)["embedded"] == 0
+
+
+def test_mode_fallback_fusion_and_visibility(setup):
+    config, source = setup
+    source.add("1", 0, "人工衛星")
+    source.add("2", 10, "電力")
+    source.add("3", 20, "人工衛星 電力")
+    sync(config, source.open)
+    model = FakeEmbedder()
+    search = Query(config, model)
+    missing = search.search("人工衛星", mode="vector")
+    assert missing["fallback"] == "fts" and model.batches == []
+    embed(config, model)
+    assert [row["id"] for row in search.search("人工衛星", mode="fts")["items"]] == ["c:1", "c:3"]
+    assert [row["id"] for row in search.search("人工衛星", mode="vector")["items"]] == ["c:2", "c:3", "c:1"]
+    hybrid = search.search("人工衛星", mode="hybrid")
+    assert [row["id"] for row in hybrid["items"]] == ["c:1", "c:3", "c:2"]
+    del source.rows["3"]
+    sync(config, source.open)
+    for mode in ("vector", "hybrid"):
+        assert {row["id"] for row in search.search("人工衛星", mode=mode)["items"]} == {"c:1", "c:2"}
+    config["discord"]["guild_ids"] = []
+    sync(config, source.open)
+    for mode in ("vector", "hybrid"):
+        assert search.search("人工衛星", mode=mode)["items"] == []
+
+
+@pytest.mark.parametrize("mode", ["fts", "vector", "hybrid"])
+def test_search_mode_pagination(setup, mode):
+    config, source = setup
+    config["limits"]["search"] = 180
+    for key in range(13):
+        source.add(str(key), key * 10, "人工衛星")
+    sync(config, source.open)
+    model = FakeEmbedder()
+    embed(config, model)
+    search = Query(config, model)
+    ids, position = [], 0
+    for _ in range(13):
+        result = search.search("人工衛星", mode=mode, position=position)
+        assert len(encode(result)) <= 180 and result["items"]
+        ids.extend(item["id"] for item in result["items"])
+        if not result["has_more"]:
+            break
+        position = result["next_position"]
+    else:
+        pytest.fail("Search did not terminate")
+    assert len(ids) == len(set(ids)) == 13
+
+
+def test_eval_synthetic_questions(setup):
+    config, source = setup
+    source.add("1", 0, "人工衛星")
+    source.add("2", 10, "電力")
+    sync(config, source.open)
+    model = FakeEmbedder()
+    embed(config, model)
+    sample = Path(__file__).with_name("questions.example.jsonl")
+    with pytest.raises(ValueError, match="word_index"):
+        evaluate(config, sample, model)
+    config["evaluation"] = {"word_index": True}
+    report = evaluate(config, sample, model)
+    assert [row["method"] for row in report] == ["fts", "word", "vector", "hybrid"]
+    assert [row["hit_rate"] for row in report] == [2 / 3] * 4
+    assert all(row["p95_ms"] >= row["median_ms"] > 0 and row["mean_characters"] > 0 for row in report)
+    assert "66.7%" in table(report)
+
+
+def test_eval_excludes_filtered_record_inside_a_returned_chunk(setup, tmp_path):
+    config, source = setup
+    source.add("1", 0, "人工衛星", author="3")
+    source.add("2", 1, "人工衛星", author="4")
+    sync(config, source.open)
+    model = FakeEmbedder()
+    embed(config, model)
+    config["evaluation"] = {"word_index": True}
+    sample = tmp_path / "questions.jsonl"
+    sample.write_text(encode({"question": "人工衛星", "answers": ["r:2"], "filters": {"person": "Person 3"}}))
+    assert [row["hit_rate"] for row in evaluate(config, sample, model)] == [0] * 4
+
+
+def test_fallback_metadata_fits_even_at_max_sqlite_ids():
+    maximum = 2**63 - 1
+    row = {"id": f"c:{maximum}", "datetime": "9999-12-31T00:00:00.123456+00:00", "excerpt": "A" * 100}
+    result = search_page([row], 180, maximum, maximum - 2, {"fallback": "fts"})
+    assert len(encode(result)) <= 180
+    assert result["items"][0]["id"] == row["id"]
+    assert result["next_position"] == maximum - 1
 
 
 def test_sync_failure_does_not_commit_partial_change(setup):

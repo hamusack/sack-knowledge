@@ -38,7 +38,14 @@ cap bounds long conversations and leaves room to return more than one chunk
 within the default retrieval budget. A message that exceeds the grouping cap
 forms a chunk by itself so its full body stays searchable. The sync compares
 chunk contents and membership in affected channels, preserving unchanged IDs
-and index entries. Embedding fields are nullable.
+and index entries. Vectors are nullable, unit-normalized little-endian float32
+blobs with the model name, dimension, and inference configuration key.
+`embed` upgrades older SQLite files when needed and processes new or changed
+chunks and vectors with an outdated key. Sync removes a discarded chunk and its
+vector together. Model files live under the configured local cache. Only the
+`embed` command downloads model files. Query inference uses the local ONNX
+graph, tokenizer, the model's search query/document prefixes, and masked mean
+pooling. Change the model name if you replace a custom model in place.
 
 Body search uses literal FTS5 trigram matching. Queries shorter than three
 characters use a SQLite LIKE scan. Period filters have inclusive starts and
@@ -53,3 +60,19 @@ slice generates no summaries. CLI and MCP return the same compact JSON payload
 and log only tool name, payload character count and elapsed time.
 The search cap must be at least 180 characters to fit a minimal result and
 pagination fields even with the largest SQLite IDs and counts.
+
+FTS uses SQLite BM25 when the trigram index can answer the query. Vector mode
+scans eligible chunks for cosine similarity. Hybrid mode adds
+`1 / (60 + rank)` from each method that found the chunk, using one-based ranks.
+Chunk ID breaks score ties. The query reports `"fallback":"fts"` when it
+cannot rank with embeddings for the configured model.
+In a minimal fallback result, the timestamp may use UTC epoch milliseconds
+if the ISO timestamp and fallback marker together would exceed the cap.
+
+The evaluation command builds and refreshes its separate word index only when
+enabled. It uses [TinySegmenter](https://pypi.org/project/tinysegmenter/) and
+SQLite's unicode61 tokenizer. Hit rate uses the first ten ranked IDs before
+the character cap, counting a record ID when a returned chunk contains it.
+Evaluation warms the vector model before measuring either vector method.
+P95 uses the nearest-rank percentile. Character counts use the capped
+response payload.

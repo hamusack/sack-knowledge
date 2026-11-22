@@ -200,6 +200,10 @@ DBの候補はSQLiteとDuckDBです。どちらも1つのファイルで全文�
 
 比べる方式は3文字単位の全文検索、単語で区切る全文検索、ベクトル検索、全文検索とベクトル検索の合成です。
 
+埋め込みの既定は、Apache 2.0のRuri v3 30mです。公開モデルカードのJMTEB検索スコアは、3,700万パラメータの30mが78.08、7,000万パラメータの70mが79.96です。30mの256次元のベクトルは、この環境のCPUで22,868まとまりを約160秒で作れました。モデルの入力上限は8,192トークンで、この実装では既定で256トークンにそろえます。[モデルカードと評価結果](https://huggingface.co/cl-nagoya/ruri-v3-30m)、[ONNX版](https://huggingface.co/kens24481/ruri-v3-30m-onnx)
+
+`pip install -e '.[search]'`で検索用の依存関係を追加し、`python -m sack_knowledge embed`で埋め込みを作ります。本文検索の既定は3文字単位の全文検索です。`search --mode vector`でベクトル検索、`search --mode hybrid`で順位を合成した検索に切り替えます。比較するには、`local/config.toml`で`evaluation.word_index = true`を設定し、質問を`local/questions.jsonl`に置いて`python -m sack_knowledge eval`を実行します。
+
 ## 未決事項
 
 - Discordの読み取り専用ロールの作成と、DBへの接続の経路。

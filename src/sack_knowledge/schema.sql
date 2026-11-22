@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     first_record_id INTEGER NOT NULL UNIQUE REFERENCES records(id),
     starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, body TEXT NOT NULL,
-    embedding BLOB, embedding_model TEXT
+    embedding BLOB, embedding_model TEXT, embedding_dimension INTEGER, embedding_key TEXT
 );
 CREATE TABLE IF NOT EXISTS chunk_records (
     chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,

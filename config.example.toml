@@ -14,6 +14,20 @@ chunk_characters = 2400
 deletion_hold_fraction = 0.20
 deletion_hold_count = 5
 
+[embedding]
+model = "cl-nagoya/ruri-v3-30m"
+cache = "local/models"
+max_tokens = 256
+threads = 8
+batch_size = 32
+# For another compatible ONNX export, set model, model_path, tokenizer_path,
+# query_prefix and passage_prefix. The graph must return token embeddings.
+
+[evaluation]
+word_index = false
+# JSONL under local/: {"question": "...", "answers": ["r:1", "c:2"], "filters": {"source": "discord"}}
+# Filters may contain start, end, person, project or source.
+
 [limits]
 search = 2000
 get = 6000
