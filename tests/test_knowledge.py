@@ -1,6 +1,8 @@
 import asyncio
 import json
 import sqlite3
+from hashlib import sha256
+from io import BytesIO
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -10,6 +12,8 @@ from mcp.shared.memory import create_connected_server_and_client_session
 
 from sack_knowledge.mcp_server import server
 from sack_knowledge.embedding import embed
+from sack_knowledge import embedding
+from sack_knowledge.errors import LocalCommandError
 from sack_knowledge.evaluation import evaluate, table
 from sack_knowledge.query import Query, bounded, encode, open_readonly, search_page
 from sack_knowledge.sync import sync
@@ -19,7 +23,10 @@ class FakeEmbedder:
     def __init__(self):
         self.batches = []
 
-    def encode(self, texts, *, query=False):
+    def lengths(self, texts, *, key):
+        return [len(text) for text in texts]
+
+    def encode(self, texts, *, key, query=False):
         self.batches.extend(texts)
         return [[1, 0] if query or "電力" in text else [1, 1] if "衛星" in text else [0, 1]
                 for text in texts]
@@ -54,6 +61,7 @@ def setup(tmp_path):
     config = {
         "storage": {"database": tmp_path / "x.sqlite", "query_log": tmp_path / "queries.jsonl"},
         "discord": {"guild_ids": ["1"], "gap_seconds": 300, "chunk_characters": 2400},
+        "embedding": {"cache": str(tmp_path / "cache")},
         "limits": {"search": 2000, "get": 6000, "count": 2000},
     }
     return config, Source()
@@ -366,7 +374,7 @@ def test_mcp_errors_never_echo_tool_arguments(setup):
     asyncio.run(call_invalid_tools())
 
 
-def test_embedding_incremental_edit_deletion_and_model_change(setup):
+def test_embedding_incremental_edit_deletion_and_model_change(setup, tmp_path):
     config, source = setup
     source.add("1", 0, "fixture")
     source.add("2", 10, "fixture")
@@ -383,7 +391,11 @@ def test_embedding_incremental_edit_deletion_and_model_change(setup):
     assert len(model.batches) == 1
     with closing(open_readonly(config["storage"]["database"])) as db:
         assert db.execute("SELECT count(*) FROM chunks WHERE embedding_dimension=2").fetchone()[0] == 2
-    config["embedding"] = {"model": "fixture-other"}
+    model_file, tokenizer = tmp_path / "model", tmp_path / "tokenizer"
+    model_file.write_bytes(b"fixture")
+    tokenizer.write_bytes(b"fixture")
+    config["embedding"] = {"model": "fixture-other", "model_path": str(model_file),
+                           "tokenizer_path": str(tokenizer)}
     assert embed(config, model)["embedded"] == 2
     assert embed(config, model)["embedded"] == 0
 
@@ -474,6 +486,155 @@ def test_fallback_metadata_fits_even_at_max_sqlite_ids():
     assert len(encode(result)) <= 180
     assert result["items"][0]["id"] == row["id"]
     assert result["next_position"] == maximum - 1
+
+
+def test_same_path_asset_edits_invalidate_vectors_and_change_rank(setup, tmp_path):
+    config, source = setup
+    source.add("1", 0, "fixture a")
+    source.add("2", 10, "fixture b")
+    sync(config, source.open)
+    model, tokenizer = tmp_path / "graph", tmp_path / "tokens"
+    model.write_bytes(b"first")
+    tokenizer.write_bytes(b"tokens")
+    config["embedding"] = {"model": "fixture", "model_path": str(model), "tokenizer_path": str(tokenizer)}
+
+    class ReplacingEmbedder(FakeEmbedder):
+        def encode(self, texts, *, key, query=False):
+            version = json.loads(key)[1]
+            wide = version == sha256(b"wide").hexdigest()
+            reversed_order = version == sha256(b"other").hexdigest()
+            vectors = [[1, 0] if query or text.endswith("b" if reversed_order else "a") else [0, 1]
+                       for text in texts]
+            return [vector + [0] for vector in vectors] if wide else vectors
+
+    runtime = ReplacingEmbedder()
+    search = Query(config, runtime)
+    assert embed(config, runtime)["embedded"] == 2
+    assert search.search("fixture", mode="vector")["items"][0]["id"] == "c:1"
+    model.write_bytes(b"other")
+    assert search.search("fixture", mode="vector")["fallback"] == "fts"
+    assert embed(config, runtime)["embedded"] == 2
+    assert search.search("fixture", mode="vector")["items"][0]["id"] == "c:2"
+    model.write_bytes(b"wide")
+    assert embed(config, runtime)["dimension"] == 3
+    tokenizer.write_bytes(b"other tokens")
+    assert embed(config, runtime)["embedded"] == 2
+    assert embed(config, runtime)["embedded"] == 0
+
+
+@pytest.mark.parametrize("asset", ["model.onnx", "tokenizer.json"])
+def test_default_rejects_tampered_cached_and_downloaded_assets(tmp_path, monkeypatch, asset):
+    cache = tmp_path / "ruri-v3-30m"
+    cache.mkdir()
+    config = {"embedding": {"cache": str(tmp_path)}}
+    model, tokenizer = cache / "model.onnx", cache / "tokenizer.json"
+    model.write_bytes(b"graph fixture")
+    tokenizer.write_bytes(b"token fixture")
+    monkeypatch.setattr(embedding, "MODEL_HASH", sha256(model.read_bytes()).hexdigest())
+    monkeypatch.setattr(embedding, "TOKENIZER_HASH", sha256(tokenizer.read_bytes()).hexdigest())
+    key = embedding.vector_key(config)
+    changed = cache / asset
+    changed.write_bytes(b"tampered")
+    with pytest.raises(LocalCommandError, match="SHA-256 mismatch"):
+        embedding.vector_key(config)
+    with pytest.raises(LocalCommandError, match="SHA-256 mismatch"):
+        embedding.LocalEmbedder(config).load(key)
+    changed.unlink()
+    monkeypatch.setattr(embedding, "urlopen", lambda url, timeout: BytesIO(b"tampered"))
+    with pytest.raises(LocalCommandError, match="SHA-256 mismatch"):
+        embedding.LocalEmbedder(config, allow_download=True).load(key)
+    assert not changed.exists()
+
+
+def test_embed_repairs_missing_model_cache_without_reembedding(setup, tmp_path, monkeypatch):
+    config, source = setup
+    source.add("1", 0, "fixture")
+    config["embedding"] = {"cache": str(tmp_path)}
+    sync(config, source.open)
+    monkeypatch.setattr(embedding, "MODEL_HASH", sha256(b"graph fixture").hexdigest())
+    monkeypatch.setattr(embedding, "TOKENIZER_HASH", sha256(b"token fixture").hexdigest())
+    assert embed(config, FakeEmbedder())["embedded"] == 1
+    monkeypatch.setattr(embedding, "urlopen", lambda url, timeout: BytesIO(
+        b"graph fixture" if url.endswith(".onnx") else b"token fixture"
+    ))
+    assert embed(config)["embedded"] == 0
+    (tmp_path / "ruri-v3-30m" / "tokenizer.json").write_bytes(b"tampered")
+
+    async def invalid_model_search():
+        async with create_connected_server_and_client_session(server(config)) as client:
+            result = await client.call_tool("search", {"query": "fixture", "mode": "vector"})
+            assert result.isError
+            assert "SHA-256 mismatch" in result.content[0].text
+
+    asyncio.run(invalid_model_search())
+
+
+def test_filtered_unembedded_chunks_are_reported_and_eval_requires_complete_vectors(setup, tmp_path):
+    config, source = setup
+    source.add("1", 0, "fixture", author="3")
+    sync(config, source.open)
+    model = FakeEmbedder()
+    embed(config, model)
+    source.add("2", 10, "fixture", author="4")
+    assert sync(config, source.open)["awaiting_embedding"] == 1
+    query = Query(config, model)
+    for mode in ("vector", "hybrid"):
+        filtered = query.search("fixture", mode=mode, person="Person 4")
+        assert filtered["fallback"] == "fts" and filtered["items"][0]["id"] == "c:2"
+        partial = query.search("fixture", mode=mode)
+        assert partial["unembedded"] == 1
+        assert len(partial["items"]) == (2 if mode == "hybrid" else 1)
+    config["evaluation"] = {"word_index": True}
+    sample = tmp_path / "questions.jsonl"
+    sample.write_text(encode({"question": "fixture", "answers": ["c:1"], "filters": {"person": "Person 3"}}))
+    with pytest.raises(LocalCommandError, match="every visible chunk"):
+        evaluate(config, sample, model)
+    embed(config, model)
+    assert sync(config, source.open)["awaiting_embedding"] == 0
+
+
+def test_eval_aborts_if_sync_commits_mid_measurement(setup, tmp_path, monkeypatch):
+    config, source = setup
+    source.add("1", 0, "fixture")
+    sync(config, source.open)
+    model = FakeEmbedder()
+    embed(config, model)
+    config["evaluation"] = {"word_index": True}
+    sample = tmp_path / "questions.jsonl"
+    sample.write_text(encode({"question": "fixture", "answers": ["r:1"]}))
+    original = Query.search
+
+    def search(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        if kwargs.get("mode") == "word":
+            source.rows["1"]["title"] = "Updated fixture title"
+            assert sync(config, source.open)["updated"] == 1
+        return result
+
+    monkeypatch.setattr(Query, "search", search)
+    with pytest.raises(LocalCommandError, match="changed during evaluation"):
+        evaluate(config, sample, model)
+
+
+def test_embedding_uses_tokens_after_the_first_window(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    class Tokenizer:
+        def encode_batch(self, texts):
+            return [SimpleNamespace(ids=[1, 2, 3, 4, 90]) for _ in texts]
+
+        def token_to_id(self, token):
+            return 0
+
+    class Session:
+        def run(self, names, inputs):
+            assert inputs["input_ids"].shape[1] <= 2
+            return [inputs["input_ids"][:, :, None].astype("float32")]
+
+    config = {"embedding": {"max_tokens": 2, "cache": str(tmp_path)}}
+    runtime = embedding.LocalEmbedder(config)
+    monkeypatch.setattr(runtime, "runtime", lambda key: (Tokenizer(), Session()))
+    assert runtime.encode(["fixture"], key=embedding.vector_key(config)).item() == 20.0
 
 
 def test_sync_failure_does_not_commit_partial_change(setup):

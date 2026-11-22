@@ -7,6 +7,8 @@ from pathlib import Path
 from statistics import mean, median
 from time import perf_counter
 
+from .embedding import awaiting_embeddings, vector_key
+from .errors import LocalCommandError
 from .query import Query, VISIBLE, encode, filters
 
 
@@ -25,8 +27,8 @@ def segment(text):
     return " ".join(token for token in tokenizer().tokenize(text) if any(char.isalnum() for char in token))
 
 
-def build_word_index(path):
-    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=60)) as db, db:
+def build_word_index(db):
+    with db:
         db.execute("BEGIN IMMEDIATE")
         db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS word_fts USING fts5(body, tokenize='unicode61')")
         db.execute("CREATE TABLE IF NOT EXISTS word_fingerprints (id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL)")
@@ -47,6 +49,7 @@ def build_word_index(path):
                        ((identifier, segment(body)) for identifier, body, _ in rows))
         db.executemany("INSERT INTO word_fingerprints VALUES (?, ?)",
                        ((identifier, fingerprint) for identifier, _, fingerprint in rows))
+        return db.execute("PRAGMA data_version").fetchone()[0]
 
 
 def questions(path):
@@ -82,10 +85,22 @@ def evaluate(config, path, embedder=None):
     if not config.get("evaluation", {}).get("word_index"):
         raise ValueError("Enable evaluation.word_index to compare all four methods")
     entries = list(questions(path))
-    build_word_index(config["storage"]["database"])
+    database = Path(config["storage"]["database"]).resolve().as_uri() + "?mode=rw"
+    with closing(sqlite3.connect(database, uri=True, timeout=60)) as monitor:
+        version = build_word_index(monitor)
+        key = vector_key(config)
+        if awaiting_embeddings(monitor, key):
+            raise LocalCommandError("Evaluation needs current embeddings for every visible chunk. Run embed first.")
+        report = measure(config, entries, embedder)
+        if monitor.execute("PRAGMA data_version").fetchone()[0] != version or vector_key(config) != key:
+            raise LocalCommandError("The corpus or embedding model changed during evaluation. Rerun eval.")
+        return report
+
+
+def measure(config, entries, embedder):
     search = Query(config, embedder)
     if "fallback" in search.search(entries[0][0], mode="vector"):
-        raise ValueError("Build embeddings before evaluation")
+        raise LocalCommandError("Evaluation needs current embeddings for every visible chunk. Run embed first.")
     report = []
     for method in METHODS:
         hits = []
@@ -104,8 +119,8 @@ def evaluate(config, path, embedder=None):
             response = search.search(text, target="body", mode=method, **options, _ranked=score)
             elapsed.append((perf_counter() - started) * 1000 - scoring_ms)
             characters.append(len(encode(response)))
-            if "fallback" in response:
-                raise ValueError("Build embeddings before evaluation")
+            if "fallback" in response or "unembedded" in response:
+                raise LocalCommandError("Embeddings became unavailable during evaluation. Rerun embed and eval.")
         report.append({
             "method": method, "hit_rate": mean(hits), "median_ms": median(elapsed),
             "p95_ms": sorted(elapsed)[math.ceil(0.95 * len(elapsed)) - 1], "mean_characters": mean(characters),

@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 from .config import load_config
+from .errors import LocalCommandError
 from .query import Query, encode
 from .sync import sync
 
@@ -58,6 +59,9 @@ def main():
         print(encode(result))
         if command == "sync" and result["deletions_held"]:
             return 1
+    except LocalCommandError as error:
+        print(f"{command} failed: {error}", file=sys.stderr)
+        return 1
     except Exception as error:
         print(f"{command} failed ({type(error).__name__})", file=sys.stderr)
         return 1

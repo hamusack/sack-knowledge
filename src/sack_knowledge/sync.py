@@ -7,6 +7,8 @@ from pathlib import Path
 from time import perf_counter
 
 from .discord import DiscordSource, connect
+from .embedding import awaiting_embeddings, vector_key
+from .errors import LocalCommandError
 
 
 def utc(value):
@@ -240,5 +242,10 @@ def sync(config, open_source=postgres_source, *, confirm_deletions=False):
                     ON CONFLICT(source, account) DO UPDATE SET last_error=excluded.last_error
                 """, ((guild, type(error).__name__) for guild in guilds))
             raise
+        try:
+            key = vector_key(config)
+        except LocalCommandError:
+            key = None
+        stats["awaiting_embedding"] = awaiting_embeddings(db, key)
     return stats | {"elapsed_ms": round((perf_counter() - start) * 1000, 2),
                     "sqlite_bytes": path.stat().st_size}

@@ -1,40 +1,35 @@
-from .embedding import allowed_chunk, unit_vectors, vector_key
+from .embedding import allowed_chunk, unit_vectors
 
 
 RRF_CONSTANT = 60
 
 
-def vector_rows(db, config, where, params):
-    if not any(row[1] == "embedding_key" for row in db.execute("PRAGMA table_info(chunks)")):
-        return None
-    key = vector_key(config)
+def vector_rows(db, key, where, params):
     if not params:
-        rows = db.execute(f"""
-            SELECT c.id, c.first_record_id AS record, c.embedding_dimension, c.embedding
-            FROM chunks c WHERE c.embedding_key=? AND c.embedding IS NOT NULL AND {allowed_chunk()}
-        """, (key,)).fetchall()
-        return rows or None
+        candidates = f"SELECT c.id, c.first_record_id AS record FROM chunks c WHERE {allowed_chunk()}"
+    else:
+        candidates = f"""
+            SELECT c.id, min(r.id) AS record FROM chunks c
+            JOIN chunk_records cr ON cr.chunk_id=c.id JOIN records r ON r.id=cr.record_id
+            WHERE {where} GROUP BY c.id
+        """
+    if not any(row[1] == "embedding_key" for row in db.execute("PRAGMA table_info(chunks)")):
+        return [], db.execute(f"SELECT count(*) FROM ({candidates})", params).fetchone()[0]
     rows = db.execute(f"""
-        SELECT c.id, min(r.id) AS record, c.embedding_dimension, c.embedding
-        FROM chunks c
-        JOIN chunk_records cr ON cr.chunk_id=c.id JOIN records r ON r.id=cr.record_id
-        WHERE c.embedding_key=? AND c.embedding IS NOT NULL AND {where}
-        GROUP BY c.id
-    """, [key, *params]).fetchall()
-    if rows:
-        return rows
-    available = db.execute(f"""
-        SELECT 1 FROM chunks c WHERE c.embedding_key=? AND c.embedding IS NOT NULL AND {allowed_chunk()}
-        LIMIT 1
-    """, (key,)).fetchone()
-    return [] if available else None
+        WITH eligible AS ({candidates})
+        SELECT e.id, e.record, c.embedding_dimension, c.embedding
+        FROM eligible e LEFT JOIN chunks c ON c.id=e.id AND c.embedding_key=?
+    """, [*params, key]).fetchall()
+    embedded = [row for row in rows if row["embedding"] is not None]
+    return embedded, len(rows) - len(embedded)
 
 
-def cosine_rank(rows, embedder, query):
+def cosine_rank(rows, embedder, query, key):
     import numpy as np
 
-    needle = unit_vectors(embedder.encode([query], query=True))[0]
-    matching = [row for row in rows if row["embedding_dimension"] == len(needle)]
+    needle = unit_vectors(embedder.encode([query], query=True, key=key))[0]
+    matching = [row for row in rows if row["embedding_dimension"] == len(needle)
+                and len(row["embedding"]) == needle.nbytes]
     if not matching:
         return {}
     matrix = np.frombuffer(b"".join(row["embedding"] for row in matching),

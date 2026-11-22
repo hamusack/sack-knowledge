@@ -7,7 +7,8 @@ from functools import wraps
 from pathlib import Path
 from time import perf_counter
 
-from .embedding import LocalEmbedder
+from .embedding import LocalEmbedder, vector_key
+from .errors import LocalCommandError
 from .ranking import cosine_rank, fuse, vector_rows
 
 
@@ -120,6 +121,8 @@ def search_page(rows, cap, total, position, metadata=None):
             if len(encode(result)) > cap:
                 # A fallback marker can require the more compact epoch-millisecond representation.
                 minimal["datetime"] = int(datetime.fromisoformat(date).timestamp() * 1000)
+            if len(encode(result)) > cap:
+                raise LocalCommandError("The search limit is too small for pagination metadata. Raise it to 200 or more.")
             shorten(result, minimal, "excerpt", row["excerpt"], cap)
             return result
     return page(items)
@@ -240,11 +243,16 @@ class Query:
         metadata = {}
         if target == "body":
             if mode in ("vector", "hybrid"):
-                eligible = vector_rows(db, self.config, where, params)
-                ranked = cosine_rank(eligible, self.embedder, query) if eligible and query.strip() else {}
-                if eligible is None or not query.strip() or (eligible and not ranked):
+                key = vector_key(self.config)
+                eligible, unembedded = vector_rows(db, key, where, params)
+                ranked = cosine_rank(eligible, self.embedder, query, key) if eligible and query.strip() else {}
+                if not query.strip() or (not ranked and (eligible or unembedded)):
                     metadata["fallback"] = "fts"
                     mode = "fts"
+                elif ranked:
+                    unembedded += len(eligible) - len(ranked)
+                    if unembedded:
+                        metadata["unembedded"] = unembedded
             if mode != "vector":
                 lexical = lexical_rows(db, where, params, query, word=mode == "word")
                 ranked = fuse(lexical, ranked) if mode == "hybrid" else lexical

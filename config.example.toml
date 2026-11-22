@@ -17,7 +17,7 @@ deletion_hold_count = 5
 [embedding]
 model = "cl-nagoya/ruri-v3-30m"
 cache = "local/models"
-max_tokens = 256
+max_tokens = 8192
 threads = 8
 batch_size = 32
 # For another compatible ONNX export, set model, model_path, tokenizer_path,

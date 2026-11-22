@@ -3,6 +3,7 @@ import logging
 from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
+from .errors import LocalCommandError
 from .query import Query, encode
 
 
@@ -23,9 +24,12 @@ def server(config):
     @app.tool(annotations=read_only, structured_output=False)
     def search(query: str = "", start: str | None = None, end: str | None = None,
                person: str | None = None, project: str | None = None, source: str | None = None,
-               target: str | None = None, position: int = 0, mode: str | None = None) -> str:
+               target: str | None = None, position: int = 0, mode: str | None = None) -> str | CallToolResult:
         """Find summaries or body excerpts."""
-        return encode(tools.search(query, start, end, person, project, source, target, position, mode))
+        try:
+            return encode(tools.search(query, start, end, person, project, source, target, position, mode))
+        except LocalCommandError as error:
+            return CallToolResult(isError=True, content=[TextContent(type="text", text=str(error))])
 
     @app.tool(annotations=read_only, structured_output=False)
     def get(ids: list[str], neighbors: int = 0) -> str:

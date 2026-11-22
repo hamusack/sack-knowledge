@@ -45,7 +45,11 @@ chunks and vectors with an outdated key. Sync removes a discarded chunk and its
 vector together. Model files live under the configured local cache. Only the
 `embed` command downloads model files. Query inference uses the local ONNX
 graph, tokenizer, the model's search query/document prefixes, and masked mean
-pooling. Change the model name if you replace a custom model in place.
+pooling across all tokens. Batches are sorted by token length; longer inputs
+are split into windows and pooled across windows. The embedding key includes
+the SHA-256 of both model files, the token limit, and the prefixes. The default
+files are verified against pinned hashes at download and load. The sync
+reports the count of visible chunks that need a current vector.
 
 Body search uses literal FTS5 trigram matching. Queries shorter than three
 characters use a SQLite LIKE scan. Period filters have inclusive starts and
@@ -65,7 +69,9 @@ FTS uses SQLite BM25 when the trigram index can answer the query. Vector mode
 scans eligible chunks for cosine similarity. Hybrid mode adds
 `1 / (60 + rank)` from each method that found the chunk, using one-based ranks.
 Chunk ID breaks score ties. The query reports `"fallback":"fts"` when it
-cannot rank with embeddings for the configured model.
+cannot rank the eligible candidates with embeddings for the configured model.
+Partial results report `unembedded` as the number of eligible chunks missing
+a current vector. Hybrid still ranks lexical matches from those chunks.
 In a minimal fallback result, the timestamp may use UTC epoch milliseconds
 if the ISO timestamp and fallback marker together would exceed the cap.
 
@@ -73,6 +79,9 @@ The evaluation command builds and refreshes its separate word index only when
 enabled. It uses [TinySegmenter](https://pypi.org/project/tinysegmenter/) and
 SQLite's unicode61 tokenizer. Hit rate uses the first ten ranked IDs before
 the character cap, counting a record ID when a returned chunk contains it.
-Evaluation warms the vector model before measuring either vector method.
+Evaluation requires a current vector for every visible chunk and warms the
+model before measuring either vector method. A SQLite data-version monitor
+rejects the report if another connection writes to the database while evaluation
+runs. The monitor is conservative and can reject a run after a no-change sync.
 P95 uses the nearest-rank percentile. Character counts use the capped
 response payload.
