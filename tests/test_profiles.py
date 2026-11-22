@@ -180,6 +180,19 @@ def test_existing_sender_metadata_backfills_without_updating_records(corpus):
     assert external.search("fixture", mode="fts", person="Fixture 3")["total"] == 2
 
 
+def test_external_queries_work_before_sender_name_table_migration(corpus):
+    config, _, _ = corpus
+    config["limits"]["search"] = 2000
+    with closing(sqlite3.connect(config["storage"]["database"])) as db, db:
+        db.execute("DROP TABLE record_sender_names")
+    query = Query(config, profile_name="remote")
+    assert query.count("person")["items"] == [{"key": 1, "label": None, "count": 2}]
+    assert query.count("person", person="1")["items"] == [{"key": 1, "label": None, "count": 2}]
+    assert query.count("person", person="Fixture 3")["items"] == []
+    result = query.search("fixture", mode="fts")
+    assert result["total"] == 2 and all(item["person"] is None for item in result["items"])
+
+
 def test_hidden_candidates_do_not_trigger_model_errors(corpus, monkeypatch):
     config, _, model = corpus
 

@@ -102,6 +102,7 @@ permissions on each call and requires clearance for all chunk members and
 summary evidence. A query-independent `withheld` flag indicates that at least
 one locally enabled source disallows external AI; it discloses no match count.
 Shared FTS term statistics can let withheld data indirectly change the relevance order of visible results.
+Gaps in sequential record, chunk, and person IDs can reveal roughly how many withheld items were created between visible ones.
 External sender names come from the visible
 records themselves. The first sync after upgrade backfills these names from
 source metadata for existing records. Evaluation runs locally.

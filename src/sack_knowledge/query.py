@@ -34,7 +34,7 @@ def timestamp(value):
 VISIBLE = visible_record()
 
 
-def filters(start, end, person, project, source, *, external=False):
+def filters(start, end, person, project, source, *, external=False, scoped_name="NULL"):
     clauses = [visible_record(external=external)]
     params = []
     if start is not None:
@@ -44,7 +44,7 @@ def filters(start, end, person, project, source, *, external=False):
         clauses.append("r.created_at < ?")
         params.append(timestamp(end))
     if person is not None:
-        name_match = ("l.role='sender' AND " + RECORD_SENDER_NAME + "=?" if external else "p.display_name=?")
+        name_match = f"l.role='sender' AND {scoped_name}=?" if external else "p.display_name=?"
         clauses.append(f"""EXISTS (
             SELECT 1 FROM record_person_links l JOIN persons p ON p.id=l.person_id
             WHERE l.record_id=r.id AND (CAST(p.id AS TEXT)=? OR ({name_match}))
@@ -63,7 +63,12 @@ def filters(start, end, person, project, source, *, external=False):
 
 SENDER = """(SELECT p.display_name FROM record_person_links l JOIN persons p ON p.id=l.person_id
               WHERE l.record_id=r.id AND l.role='sender') AS person"""
-RECORD_SENDER_NAME = "(SELECT display_name FROM record_sender_names n WHERE n.record_id=r.id)"
+
+
+def scoped_sender_name(db):
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='record_sender_names'").fetchone():
+        return "(SELECT display_name FROM record_sender_names n WHERE n.record_id=r.id)"
+    return "NULL"
 RECORD = """'r:' || r.id AS id, r.created_at AS datetime, r.source,
             r.original_ref, r.title, r.body"""
 
@@ -264,9 +269,10 @@ class Query:
             mode == "word" and (_ranked is None or self.external)
         ):
             raise ValueError("Invalid search mode")
-        where, params = filters(start, end, person, project, source, external=self.external)
+        scoped_name = scoped_sender_name(db) if self.external else "NULL"
+        where, params = filters(start, end, person, project, source, external=self.external, scoped_name=scoped_name)
         metadata = self.metadata(db)
-        sender = f"{RECORD_SENDER_NAME} AS person" if self.external else SENDER
+        sender = f"{scoped_name} AS person" if self.external else SENDER
         if target == "body":
             if mode in ("vector", "hybrid"):
                 eligible, unembedded, key = vector_rows(
@@ -367,7 +373,8 @@ class Query:
 
     @query_tool
     def count(self, db, group_by, start=None, end=None, person=None, project=None, source=None):
-        person_label = f"min(CASE WHEN l.role='sender' THEN {RECORD_SENDER_NAME} END)" if self.external else "p.display_name"
+        scoped_name = scoped_sender_name(db) if self.external and (group_by == "person" or person is not None) else "NULL"
+        person_label = f"min(CASE WHEN l.role='sender' THEN {scoped_name} END)" if self.external else "p.display_name"
         groups = {
             "month": ("substr(r.created_at,1,7)", "substr(r.created_at,1,7)", ""),
             "person": ("p.id", person_label, """JOIN record_person_links l ON l.record_id=r.id
@@ -378,7 +385,7 @@ class Query:
         if group_by not in groups:
             raise ValueError("Invalid count axis")
         key, label, join = groups[group_by]
-        where, params = filters(start, end, person, project, source, external=self.external)
+        where, params = filters(start, end, person, project, source, external=self.external, scoped_name=scoped_name)
         rows = [dict(row) for row in db.execute(f"""
             SELECT {key} AS key, {label} AS label, count(DISTINCT r.id) AS count
             FROM records r {join} WHERE {where}
