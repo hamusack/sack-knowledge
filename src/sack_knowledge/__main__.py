@@ -23,7 +23,9 @@ def main():
         for field in ("start", "end", "person", "project", "source"):
             command.add_argument(f"--{field}")
     commands.add_parser("mcp")
-    commands.add_parser("sync").add_argument("source", choices=("discord",))
+    sync_command = commands.add_parser("sync")
+    sync_command.add_argument("source", choices=("discord",))
+    sync_command.add_argument("--confirm-deletions", action="store_true")
     options = vars(parser.parse_args())
     command = options.pop("command")
     try:
@@ -34,10 +36,12 @@ def main():
             server(config).run(transport="stdio")
             return 0
         if command == "sync":
-            result = sync(config)
+            result = sync(config, confirm_deletions=options["confirm_deletions"])
         else:
             result = getattr(Query(config), command)(**options)
         print(encode(result))
+        if command == "sync" and result["deletions_held"]:
+            return 1
     except Exception as error:
         print(f"{command} failed ({type(error).__name__})", file=sys.stderr)
         return 1

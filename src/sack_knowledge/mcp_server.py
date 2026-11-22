@@ -1,14 +1,22 @@
 import logging
 
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from .query import Query, encode
 
 
+class PrivateFastMCP(FastMCP):
+    async def call_tool(self, name, arguments):
+        try:
+            return await super().call_tool(name, arguments)
+        except Exception:
+            return CallToolResult(isError=True, content=[TextContent(type="text", text="Tool call failed.")])
+
+
 def server(config):
     logging.getLogger("mcp").setLevel(logging.CRITICAL)
-    app = FastMCP("sack-knowledge", log_level="CRITICAL")
+    app = PrivateFastMCP("sack-knowledge", log_level="CRITICAL")
     read_only = ToolAnnotations(readOnlyHint=True)
     tools = Query(config)
 

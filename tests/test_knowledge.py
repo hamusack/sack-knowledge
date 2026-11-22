@@ -1,11 +1,14 @@
+import asyncio
 import json
 import sqlite3
 from contextlib import closing, contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
+from mcp.shared.memory import create_connected_server_and_client_session
 
-from sack_knowledge.query import Query, encode, open_readonly
+from sack_knowledge.mcp_server import server
+from sack_knowledge.query import Query, bounded, encode, open_readonly
 from sack_knowledge.sync import sync
 
 
@@ -127,13 +130,106 @@ def test_filtered_match_and_allow_list(setup):
     config["discord"]["gap_seconds"] = 10
     assert sync(config, source.open)["chunks_built"] == 2
     config["discord"]["guild_ids"] = []
-    query = Query(config)
+    def unexpected_connection(options):
+        pytest.fail("Revoking all guilds must not connect")
+
+    result = sync(config, unexpected_connection)
+    assert result["deleted"] == 0 and not result["deletions_held"]
     assert query.search("bravo", target="body")["total"] == 0
     assert query.get(["r:1"])["items"] == []
     assert query.count("source")["items"] == []
+    with closing(open_readonly(config["storage"]["database"])) as db:
+        assert db.execute("SELECT sum(deleted), count(*) FROM records").fetchone()[:] == (0, 2)
+    config["discord"]["guild_ids"] = ["1"]
+    sync(config, source.open)
+    assert query.count("source")["items"][0]["count"] == 2
     config["storage"]["query_log"] = config["storage"]["database"]
     with pytest.raises(ValueError, match="separate file"):
         Query(config)
+
+
+@pytest.mark.parametrize(("size", "removed"), [(3, 3), (100, 51)])
+def test_bulk_deletion_hold_and_confirmation(setup, size, removed):
+    config, source = setup
+    for key in range(size):
+        source.add(str(key), key, "fixture")
+    sync(config, source.open)
+    for key in range(removed):
+        del source.rows[str(key)]
+    if removed < size:
+        source.rows[str(removed)]["body"] = "updated fixture"
+        source.add(str(size), size, "new fixture")
+    result = sync(config, source.open)
+    assert result["deleted"] == 0
+    assert result["updated"] == result["inserted"] == int(removed < size)
+    assert result["deletions_held"] == [{
+        "status": "deletions held", "live_local": size, "source_rows": len(source.rows), "missing": removed
+    }]
+    with closing(open_readonly(config["storage"]["database"])) as db:
+        assert json.loads(db.execute("SELECT last_error FROM sync_state").fetchone()[0]) == result["deletions_held"][0]
+    result = sync(config, source.open, confirm_deletions=True)
+    assert result["deleted"] == removed and not result["deletions_held"]
+
+
+def test_tight_search_cap_preserves_position(setup):
+    config, source = setup
+    for key in range(2):
+        source.add(str(key), key * 10, "fixture " * 10)
+        source.rows[str(key)]["title"] = "X" * 500
+    sync(config, source.open)
+    config["limits"]["search"] = 180
+    query = Query(config)
+    first = query.search("fixture", target="body")
+    assert len(encode(first)) <= 180 and first["next_position"] == 1
+    assert set(first["items"][0]) == {"id", "datetime", "excerpt"}
+    second = query.search("fixture", target="body", position=first["next_position"])
+    assert len(encode(second)) <= 180
+    assert second["items"][0]["id"] != first["items"][0]["id"]
+    max_id = 2**63 - 1
+    largest = bounded([{"id": f"c:{max_id}", "datetime": "2025-01-01T00:00:00.123456+00:00",
+                        "excerpt": "A" * 100}], 180, total=max_id, position=max_id - 2)
+    assert largest["items"][0]["id"] == f"c:{max_id}"
+    assert largest["next_position"] == max_id - 1 and len(encode(largest)) <= 180
+
+
+@pytest.mark.parametrize("term", ['"abc"', "aaa OR bbb", "NEAR(aaa bbb)", "body:aaa"])
+def test_fts_special_characters_are_literal(setup, term):
+    config, source = setup
+    source.add("1", 0, term)
+    source.add("2", 15, "aaa bbb abc")
+    sync(config, source.open)
+    assert Query(config).search(term, target="body")["total"] == 1
+
+
+def test_deleted_records_and_neighbors_are_hidden_and_times_are_utc(setup):
+    config, source = setup
+    for key in range(3):
+        source.add(str(key), key, "fixture")
+    source.rows["0"]["created_at"] = datetime(2025, 1, 1, 9, tzinfo=timezone(timedelta(hours=9)))
+    sync(config, source.open)
+    query = Query(config)
+    assert query.get(["r:1"])["items"][0]["datetime"] == "2025-01-01T00:00:00.000000+00:00"
+    del source.rows["1"]
+    sync(config, source.open)
+    assert query.get(["r:2"])["items"] == []
+    assert [item["id"] for item in query.get(["r:1"], neighbors=2)["items"]] == ["r:1", "r:3"]
+    assert query.count("source")["items"][0]["count"] == 2
+
+
+def test_mcp_errors_never_echo_tool_arguments(setup):
+    config, _ = setup
+
+    async def call_invalid_tools():
+        async with create_connected_server_and_client_session(server(config)) as client:
+            for tool, arguments in (
+                ("search", {"query": {"synthetic_marker": 123}}),
+                ("get", {"ids": ["synthetic_marker"]}),
+            ):
+                result = await client.call_tool(tool, arguments)
+                assert result.isError
+                assert [block.text for block in result.content] == ["Tool call failed."]
+
+    asyncio.run(call_invalid_tools())
 
 
 def test_sync_failure_does_not_commit_partial_change(setup):

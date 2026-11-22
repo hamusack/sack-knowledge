@@ -107,7 +107,9 @@ def rebuild(db, guild, channel, gap, cap):
     return len(proposed), len(existing)
 
 
-def sync_guild(db, source, guild, now, gap, cap, stats):
+def sync_guild(db, source, guild, options, confirm_deletions, stats):
+    now = utc(datetime.now(UTC))
+    gap, cap = options["gap_seconds"], options["chunk_characters"]
     manifest = source.manifest(guild)
     known = {row["source_id"]: row for row in db.execute("""
         SELECT id, source_id, channel_id, fingerprint, deleted FROM records
@@ -139,15 +141,26 @@ def sync_guild(db, source, guild, now, gap, cap, stats):
         channels.add(message["channel_id"])
     if len(affected_ids) != len(changed):
         raise RuntimeError("Discord snapshot changed")
-    for key in known.keys() - manifest.keys():
+    live = {key for key, row in known.items() if not row["deleted"]}
+    missing = live - manifest.keys()
+    held = None
+    if missing and not confirm_deletions and (
+        not manifest or (
+            len(missing) > options.get("deletion_hold_count", 50)
+            and len(missing) / len(live) > options.get("deletion_hold_fraction", 0.20)
+        )
+    ):
+        held = dict(status="deletions held", live_local=len(live), source_rows=len(manifest), missing=len(missing))
+        stats["deletions_held"].append(held)
+        missing.clear()
+    for key in missing:
         row = known[key]
-        if not row["deleted"]:
-            db.execute("UPDATE records SET deleted=1 WHERE id=?", (row["id"],))
-            db.execute("DELETE FROM record_relations WHERE kind='reply' AND (record_id=? OR related_record_id=?)",
-                       (row["id"], row["id"]))
-            channels.add(row["channel_id"])
-            affected_ids.append(row["id"])
-            stats["deleted"] += 1
+        db.execute("UPDATE records SET deleted=1 WHERE id=?", (row["id"],))
+        db.execute("DELETE FROM record_relations WHERE kind='reply' AND (record_id=? OR related_record_id=?)",
+                   (row["id"], row["id"]))
+        channels.add(row["channel_id"])
+        affected_ids.append(row["id"])
+        stats["deleted"] += 1
     if affected_ids:
         db.execute("""
             INSERT OR IGNORE INTO record_relations
@@ -165,6 +178,13 @@ def sync_guild(db, source, guild, now, gap, cap, stats):
         built, removed = rebuild(db, guild, channel, gap, cap)
         stats["chunks_built"] += built
         stats["chunks_removed"] += removed
+    db.execute("""
+        INSERT INTO sync_state(source, account, token, last_success, last_error)
+        VALUES ('discord', ?, ?, ?, ?)
+        ON CONFLICT(source, account) DO UPDATE SET token=excluded.token,
+            last_success=coalesce(excluded.last_success, sync_state.last_success),
+            last_error=excluded.last_error
+    """, (guild, f"{gap}:{cap}", None if held else utc(datetime.now(UTC)), json.dumps(held) if held else None))
 
 
 @contextmanager
@@ -173,16 +193,18 @@ def postgres_source(config):
         yield DiscordSource(connection)
 
 
-def sync(config, open_source=postgres_source):
+def sync(config, open_source=postgres_source, *, confirm_deletions=False):
     start = perf_counter()
     options = config["discord"]
     guilds = sorted(set(options["guild_ids"]))
     gap, cap = options["gap_seconds"], options["chunk_characters"]
-    if not guilds or any(not guild.isdecimal() or not guild.isascii() for guild in guilds) or gap < 0 or cap < 1:
+    if (any(not guild.isdecimal() or not guild.isascii() for guild in guilds) or gap < 0 or cap < 1
+            or not 0 <= options.get("deletion_hold_fraction", 0.20) <= 1
+            or options.get("deletion_hold_count", 50) < 0):
         raise ValueError("Invalid Discord sync configuration")
     path = Path(config["storage"]["database"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    stats = dict(inserted=0, updated=0, deleted=0, chunks_built=0, chunks_removed=0)
+    stats = dict(inserted=0, updated=0, deleted=0, chunks_built=0, chunks_removed=0, deletions_held=[])
     with closing(sqlite3.connect(path, timeout=60)) as db:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
@@ -190,9 +212,10 @@ def sync(config, open_source=postgres_source):
         try:
             with db:
                 db.execute("BEGIN IMMEDIATE")
-                with open_source(options) as source:
-                    for guild in guilds:
-                        sync_guild(db, source, guild, utc(datetime.now(UTC)), gap, cap, stats)
+                if guilds:
+                    with open_source(options) as source:
+                        for guild in guilds:
+                            sync_guild(db, source, guild, options, confirm_deletions, stats)
                 db.execute("""
                     UPDATE allow_list SET local_storage=0 WHERE source='discord' AND local_storage=1
                     AND target NOT IN (SELECT value FROM json_each(?))
@@ -201,11 +224,6 @@ def sync(config, open_source=postgres_source):
                     INSERT INTO allow_list(source, target, local_storage) VALUES ('discord', ?, 1)
                     ON CONFLICT(source, target) DO UPDATE SET local_storage=1 WHERE local_storage=0
                 """, ((guild,) for guild in guilds))
-                db.executemany("""
-                    INSERT INTO sync_state(source, account, token, last_success) VALUES ('discord', ?, ?, ?)
-                    ON CONFLICT(source, account) DO UPDATE SET
-                        token=excluded.token, last_success=excluded.last_success, last_error=NULL
-                """, ((guild, f"{gap}:{cap}", utc(datetime.now(UTC))) for guild in guilds))
         except Exception as error:
             with db:
                 db.executemany("""

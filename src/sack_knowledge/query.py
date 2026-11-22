@@ -26,8 +26,13 @@ def timestamp(value):
     return parsed.astimezone(UTC).isoformat(timespec="microseconds")
 
 
+VISIBLE = """r.deleted=0 AND (r.source <> 'discord' OR EXISTS (
+    SELECT 1 FROM allow_list a WHERE a.source=r.source AND a.target=r.account AND a.local_storage=1
+))"""
+
+
 def filters(start, end, person, project, source):
-    clauses = ["r.deleted=0", "(r.source <> 'discord' OR guild_allowed(r.account))"]
+    clauses = [VISIBLE]
     params = []
     if start is not None:
         clauses.append("r.created_at >= ?")
@@ -76,7 +81,6 @@ def query_tool(function: Callable):
         characters = 0
         try:
             with closing(open_readonly(self.database)) as db:
-                db.create_function("guild_allowed", 1, self.guilds.__contains__, deterministic=True)
                 db.create_function("contains_text", 2, lambda body, term: term.casefold() in body.casefold(),
                                    deterministic=True)
                 db.execute("BEGIN")
@@ -108,8 +112,12 @@ def bounded(rows, cap, *, total=None, position=None):
         field = "body" if "body" in row else "excerpt" if "excerpt" in row else None
         if field and not result["items"]:
             original = row[field]
-            row[field] = ""
-            row["truncated"] = True
+            if position is not None:
+                date = row["datetime"].replace("+00:00", "Z").replace(".000000Z", "Z")
+                row = {"id": row["id"], "datetime": date, "excerpt": ""}
+            else:
+                row[field] = ""
+                row["truncated"] = True
             result["items"].append(row)
             for optional in ("person", "title"):
                 if optional in row and len(encode(result)) > cap:
@@ -130,13 +138,13 @@ def bounded(rows, cap, *, total=None, position=None):
     returned = len(result["items"])
     result["has_more"] = returned < len(rows) or (total is not None and (position or 0) + returned < total)
     if position is not None:
-        result["next_position"] = position + max(1, returned) if result["has_more"] else None
+        result["next_position"] = position + returned if result["has_more"] else None
     # The true/false and numeric/null variants can have different encoded lengths.
     while len(encode(result)) > cap and result["items"]:
         result["items"].pop()
         result["has_more"] = True
         if position is not None:
-            result["next_position"] = position + max(1, len(result["items"]))
+            result["next_position"] = position + len(result["items"])
     return result
 
 
@@ -148,10 +156,10 @@ class Query:
             self.log.exists() and self.database.exists() and self.log.samefile(self.database)
         ):
             raise ValueError("Query log must use a separate file")
-        self.guilds = frozenset(config["discord"]["guild_ids"])
         self.limits = config["limits"]
-        if any(self.limits[name] < 128 for name in ("search", "get", "count")):
-            raise ValueError("Response limits must be at least 128 characters")
+        # Leave room for a minimal search item and pagination with 64-bit IDs and counts.
+        if self.limits["search"] < 180 or any(self.limits[name] < 128 for name in ("get", "count")):
+            raise ValueError("Minimum response limits are 180 for search and 128 for get and count")
 
     @query_tool
     def search(self, db, query="", start=None, end=None, person=None, project=None, source=None,
@@ -214,16 +222,14 @@ class Query:
             if key >= 2**63:
                 raise ValueError("Invalid record or chunk ID")
             if prefix == "r":
-                item = db.execute(f"""SELECT {RECORD} FROM records r WHERE r.id=? AND NOT r.deleted
-                                      AND (r.source <> 'discord' OR guild_allowed(r.account))""",
+                item = db.execute(f"SELECT {RECORD} FROM records r WHERE r.id=? AND {VISIBLE}",
                                   (key,)).fetchone()
             else:
-                item = db.execute("""
+                item = db.execute(f"""
                     SELECT 'c:' || c.id AS id, c.starts_at AS datetime, r.source,
                            r.original_ref, r.title, c.body
                     FROM chunks c JOIN records r ON r.id=c.first_record_id
-                    WHERE c.id=? AND NOT r.deleted
-                      AND (r.source <> 'discord' OR guild_allowed(r.account))
+                    WHERE c.id=? AND {VISIBLE}
                 """, (key,)).fetchone()
             if item is None:
                 continue
@@ -236,7 +242,7 @@ class Query:
                         edge AS (SELECT * FROM members ORDER BY created_at {edge_order}, id {edge_order} LIMIT 1)
                         SELECT {RECORD} FROM edge e JOIN records r
                             ON (r.source,r.account,r.channel_id)=(e.source,e.account,e.channel_id)
-                        WHERE NOT r.deleted AND (r.created_at,r.id) {op} (e.created_at,e.id)
+                        WHERE {VISIBLE} AND (r.created_at,r.id) {op} (e.created_at,e.id)
                         ORDER BY r.created_at {order}, r.id {order} LIMIT ?
                     """
                     for row in db.execute(neighbors_sql, (key, min(neighbors, cap))):

@@ -8,6 +8,8 @@ Discordの既存DBからSQLiteに発言を取り込み、CLIとMCPで検索、�
 
 リポジトリのルートで次のコマンドを実行します。設定をコピーしたら、`local/config.toml`に読み取り専用の接続情報、パスワードファイルのパス、取り込むGuildのIDを記入します。
 
+同期を実行するには、ホストのDockerを操作でき、コンテナのアドレスのTCPポート5432に接続できる必要があります。
+
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -e .
