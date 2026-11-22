@@ -125,7 +125,8 @@ def test_search_filters_caps_and_neighbors(setup):
     with pytest.raises(ValueError):
         query.get(["r:1"] * 6)
     entries = [json.loads(line) for line in config["storage"]["query_log"].read_text().splitlines()]
-    assert set(entries[-1]) == {"tool", "characters", "elapsed_ms"}
+    assert set(entries[-1]) == {"tool", "characters", "elapsed_ms", "profile", "external"}
+    assert entries[-1]["profile"] == "local" and entries[-1]["external"] is False
 
 
 def test_get_chunk_neighbors_outside_both_edges(setup):
@@ -550,6 +551,7 @@ def test_embed_repairs_missing_model_cache_without_reembedding(setup, tmp_path, 
     config, source = setup
     source.add("1", 0, "fixture")
     config["embedding"] = {"cache": str(tmp_path)}
+    config["discord"]["external_ai"] = {"1": True}
     sync(config, source.open)
     monkeypatch.setattr(embedding, "MODEL_HASH", sha256(b"graph fixture").hexdigest())
     monkeypatch.setattr(embedding, "TOKENIZER_HASH", sha256(b"token fixture").hexdigest())

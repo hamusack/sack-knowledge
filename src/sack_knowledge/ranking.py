@@ -1,27 +1,32 @@
-from .embedding import allowed_chunk, unit_vectors
+from .embedding import unit_vectors
+from .visibility import visible_chunk
 
 
 RRF_CONSTANT = 60
 
 
-def vector_rows(db, key, where, params):
+def vector_rows(db, resolve_key, where, params, *, external=False):
+    allowed = visible_chunk(external=external)
     if not params:
-        candidates = f"SELECT c.id, c.first_record_id AS record FROM chunks c WHERE {allowed_chunk()}"
+        candidates = f"SELECT c.id, c.first_record_id AS record FROM chunks c WHERE {allowed}"
     else:
         candidates = f"""
             SELECT c.id, min(r.id) AS record FROM chunks c
             JOIN chunk_records cr ON cr.chunk_id=c.id JOIN records r ON r.id=cr.record_id
-            WHERE {where} GROUP BY c.id
+            WHERE {where} {"AND " + allowed if external else ""} GROUP BY c.id
         """
+    if external and not db.execute(f"SELECT 1 FROM ({candidates}) LIMIT 1", params).fetchone():
+        return [], 0, None
+    key = resolve_key()
     if not any(row[1] == "embedding_key" for row in db.execute("PRAGMA table_info(chunks)")):
-        return [], db.execute(f"SELECT count(*) FROM ({candidates})", params).fetchone()[0]
+        return [], db.execute(f"SELECT count(*) FROM ({candidates})", params).fetchone()[0], key
     rows = db.execute(f"""
         WITH eligible AS ({candidates})
         SELECT e.id, e.record, c.embedding_dimension, c.embedding
         FROM eligible e LEFT JOIN chunks c ON c.id=e.id AND c.embedding_key=?
     """, [*params, key]).fetchall()
     embedded = [row for row in rows if row["embedding"] is not None]
-    return embedded, len(rows) - len(embedded)
+    return embedded, len(rows) - len(embedded), key
 
 
 def cosine_rank(rows, embedder, query, key):

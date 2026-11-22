@@ -46,6 +46,10 @@ def upsert(db, guild, message, fingerprint, now):
           message["title"], message["body"] or "", f"https://discord.com/channels/{guild}/{channel}/{source_id}",
           channel, fingerprint, message["reply_id"])).fetchone()[0]
     db.execute("DELETE FROM record_person_links WHERE record_id=?", (record,))
+    db.execute("""
+        INSERT INTO record_sender_names VALUES (?, ?)
+        ON CONFLICT(record_id) DO UPDATE SET display_name=excluded.display_name
+    """, (record, message["author_name"] if message["author_id"] else None))
     db.execute("DELETE FROM record_relations WHERE record_id=? AND kind='reply'", (record,))
     if message["author_id"]:
         db.execute("INSERT INTO record_person_links VALUES (?, ?, 'sender')",
@@ -107,6 +111,18 @@ def rebuild(db, guild, channel, gap, cap):
         db.execute("INSERT INTO chunk_fts(rowid, body) VALUES (?, ?)", (chunk, body))
         db.executemany("INSERT INTO chunk_records VALUES (?, ?)", ((chunk, record) for record in ids))
     return len(proposed), len(existing)
+
+
+def fill_sender_names(db, source, guild, manifest):
+    missing = {row["source_id"]: row["id"] for row in db.execute("""
+        SELECT r.id, r.source_id FROM records r
+        LEFT JOIN record_sender_names n ON n.record_id=r.id
+        WHERE r.source='discord' AND r.account=? AND r.deleted=0 AND n.record_id IS NULL
+    """, (guild,)) if row["source_id"] in manifest}
+    if missing:
+        db.executemany("INSERT INTO record_sender_names VALUES (?, ?)", (
+            (missing[row["source_id"]], row["author_name"]) for row in source.sender_names(guild, sorted(missing))
+        ))
 
 
 def sync_guild(db, source, guild, options, confirm_deletions, stats):
@@ -188,6 +204,7 @@ def sync_guild(db, source, guild, options, confirm_deletions, stats):
         built, removed = rebuild(db, guild, channel, gap, cap)
         stats["chunks_built"] += built
         stats["chunks_removed"] += removed
+    fill_sender_names(db, source, guild, manifest)
     db.execute("""
         INSERT INTO sync_state(source, account, token, last_success, last_error)
         VALUES ('discord', ?, ?, ?, ?)
@@ -206,12 +223,18 @@ def postgres_source(config):
 def sync(config, open_source=postgres_source, *, confirm_deletions=False):
     start = perf_counter()
     options = config["discord"]
-    guilds = sorted(set(options["guild_ids"]))
+    guilds = set(options["guild_ids"])
+    external = options.get("external_ai", {})
+    if not isinstance(external, dict) or any(type(value) is not bool for value in external.values()):
+        raise ValueError("Invalid Discord external AI permissions")
+    targets = guilds | external.keys()
     gap, cap = options["gap_seconds"], options["chunk_characters"]
-    if (any(not guild.isdecimal() or not guild.isascii() for guild in guilds) or gap < 0 or cap < 1
+    if (any(not isinstance(guild, str) or not guild.isdecimal() or not guild.isascii() for guild in targets)
+            or gap < 0 or cap < 1
             or not 0 <= options.get("deletion_hold_fraction", 0.20) <= 1
             or options.get("deletion_hold_count", 5) < 1):
         raise ValueError("Invalid Discord sync configuration")
+    targets = sorted(targets)
     path = Path(config["storage"]["database"])
     path.parent.mkdir(parents=True, exist_ok=True)
     stats = dict(inserted=0, updated=0, deleted=0, chunks_built=0, chunks_removed=0, deletions_held=[])
@@ -221,19 +244,22 @@ def sync(config, open_source=postgres_source, *, confirm_deletions=False):
         db.executescript(Path(__file__).with_name("schema.sql").read_text())
         with db:
             db.execute("""
-                UPDATE allow_list SET local_storage=0 WHERE source='discord' AND local_storage=1
+                UPDATE allow_list SET local_storage=0, external_ai=0
+                WHERE source='discord' AND (local_storage<>0 OR external_ai<>0)
                 AND target NOT IN (SELECT value FROM json_each(?))
-            """, (json.dumps(guilds),))
+            """, (json.dumps(targets),))
             db.executemany("""
-                INSERT INTO allow_list(source, target, local_storage) VALUES ('discord', ?, 1)
-                ON CONFLICT(source, target) DO UPDATE SET local_storage=1 WHERE local_storage=0
-            """, ((guild,) for guild in guilds))
+                INSERT INTO allow_list(source, target, local_storage, external_ai) VALUES ('discord', ?, ?, ?)
+                ON CONFLICT(source, target) DO UPDATE SET
+                    local_storage=excluded.local_storage, external_ai=excluded.external_ai
+                WHERE local_storage<>excluded.local_storage OR external_ai<>excluded.external_ai
+            """, ((guild, guild in guilds, external.get(guild, False)) for guild in targets))
         try:
             with db:
                 db.execute("BEGIN IMMEDIATE")
                 if guilds:
                     with open_source(options) as source:
-                        for guild in guilds:
+                        for guild in sorted(guilds):
                             sync_guild(db, source, guild, options, confirm_deletions, stats)
         except Exception as error:
             with db:

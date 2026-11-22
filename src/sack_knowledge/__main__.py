@@ -25,7 +25,9 @@ def main():
     for command in (search, count):
         for field in ("start", "end", "person", "project", "source"):
             command.add_argument(f"--{field}")
-    commands.add_parser("mcp")
+    mcp = commands.add_parser("mcp")
+    for command in (search, get, count, mcp):
+        command.add_argument("--profile")
     commands.add_parser("embed")
     commands.add_parser("refresh")
     backup_command = commands.add_parser("backup")
@@ -44,7 +46,7 @@ def main():
         if command == "mcp":
             from .mcp_server import server
 
-            server(config).run(transport="stdio")
+            server(config, profile_name=options["profile"]).run(transport="stdio")
             return 0
         if command == "sync":
             result = sync(config, confirm_deletions=options["confirm_deletions"])
@@ -69,7 +71,7 @@ def main():
             print(table(evaluate(config, questions)))
             return 0
         else:
-            result = getattr(Query(config), command)(**options)
+            result = getattr(Query(config, profile_name=options.pop("profile")), command)(**options)
         print(encode(result))
         if command == "sync" and result["deletions_held"]:
             return 1

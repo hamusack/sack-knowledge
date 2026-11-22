@@ -94,3 +94,14 @@ Backup retention and verification use the backup tag, the source root, and a
 host label derived from the machine ID. Snapshots made before host scoping
 were introduced are retained separately and require explicit selection for
 manual recovery. The managed snapshot count covers this source only.
+
+Caller profiles are launch-time declarations. A local CLI is the default;
+MCP and undefined profile names default to external. The log records the
+effective profile and external flag. The external policy reads committed
+permissions on each call and requires clearance for all chunk members and
+summary evidence. A query-independent `withheld` flag indicates that at least
+one locally enabled source disallows external AI; it discloses no match count.
+External FTS orders visible matches by date, since index-wide BM25 scores can
+change when hidden data changes. External sender names come from the visible
+records themselves. The first sync after upgrade backfills these names from
+source metadata for existing records. Evaluation runs locally.

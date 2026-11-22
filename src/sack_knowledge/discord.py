@@ -41,6 +41,13 @@ class DiscordSource:
         """, (guild,))
         return {row["source_id"]: row["fingerprint"] for row in rows}
 
+    def sender_names(self, guild, ids):
+        for offset in range(0, len(ids), 5000):
+            yield from self.connection.execute("""
+                SELECT message_id::text AS source_id, author_display_name AS author_name
+                FROM public.messages WHERE guild_id::text = %s AND message_id::text = ANY(%s)
+            """, (guild, ids[offset:offset + 5000]))
+
     def messages(self, guild, ids):
         for offset in range(0, len(ids), 5000):
             yield from self.connection.execute("""

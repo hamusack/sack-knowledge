@@ -14,6 +14,17 @@ chunk_characters = 2400
 deletion_hold_fraction = 0.20
 deletion_hold_count = 5
 
+# Guilds in guild_ids may be stored locally. External AI needs separate opt-in.
+# An omitted guild defaults to false here.
+[discord.external_ai]
+"<guild-id>" = false
+
+[profiles.local]
+external = false
+
+[profiles.external]
+external = true
+
 [embedding]
 model = "cl-nagoya/ruri-v3-30m"
 cache = "local/models"

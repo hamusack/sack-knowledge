@@ -15,11 +15,11 @@ class PrivateFastMCP(FastMCP):
             return CallToolResult(isError=True, content=[TextContent(type="text", text="Tool call failed.")])
 
 
-def server(config):
+def server(config, *, profile_name=None):
     logging.getLogger("mcp").setLevel(logging.CRITICAL)
     app = PrivateFastMCP("sack-knowledge", log_level="CRITICAL")
     read_only = ToolAnnotations(readOnlyHint=True)
-    tools = Query(config)
+    tools = Query(config, profile_name=profile_name, default_external=True)
 
     @app.tool(annotations=read_only, structured_output=False)
     def search(query: str = "", start: str | None = None, end: str | None = None,

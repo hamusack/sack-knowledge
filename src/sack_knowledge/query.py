@@ -10,6 +10,7 @@ from time import perf_counter
 from .embedding import LocalEmbedder, vector_key
 from .errors import LocalCommandError
 from .ranking import cosine_rank, fuse, vector_rows
+from .visibility import profile, visible_chunk, visible_record
 
 
 def encode(value):
@@ -30,13 +31,11 @@ def timestamp(value):
     return parsed.astimezone(UTC).isoformat(timespec="microseconds")
 
 
-VISIBLE = """r.deleted=0 AND (r.source <> 'discord' OR EXISTS (
-    SELECT 1 FROM allow_list a WHERE a.source=r.source AND a.target=r.account AND a.local_storage=1
-))"""
+VISIBLE = visible_record()
 
 
-def filters(start, end, person, project, source):
-    clauses = [VISIBLE]
+def filters(start, end, person, project, source, *, external=False):
+    clauses = [visible_record(external=external)]
     params = []
     if start is not None:
         clauses.append("r.created_at >= ?")
@@ -45,9 +44,10 @@ def filters(start, end, person, project, source):
         clauses.append("r.created_at < ?")
         params.append(timestamp(end))
     if person is not None:
-        clauses.append("""EXISTS (
+        name_match = ("l.role='sender' AND " + RECORD_SENDER_NAME + "=?" if external else "p.display_name=?")
+        clauses.append(f"""EXISTS (
             SELECT 1 FROM record_person_links l JOIN persons p ON p.id=l.person_id
-            WHERE l.record_id=r.id AND (CAST(p.id AS TEXT)=? OR p.display_name=?)
+            WHERE l.record_id=r.id AND (CAST(p.id AS TEXT)=? OR ({name_match}))
         )""")
         params.extend((person, person))
     if project is not None:
@@ -63,6 +63,7 @@ def filters(start, end, person, project, source):
 
 SENDER = """(SELECT p.display_name FROM record_person_links l JOIN persons p ON p.id=l.person_id
               WHERE l.record_id=r.id AND l.role='sender') AS person"""
+RECORD_SENDER_NAME = "(SELECT display_name FROM record_sender_names n WHERE n.record_id=r.id)"
 RECORD = """'r:' || r.id AS id, r.created_at AS datetime, r.source,
             r.original_ref, r.title, r.body"""
 
@@ -93,7 +94,8 @@ def query_tool(function: Callable):
             return result
         finally:
             entry = {"tool": function.__name__, "characters": characters,
-                     "elapsed_ms": round((perf_counter() - started) * 1000, 2)}
+                     "elapsed_ms": round((perf_counter() - started) * 1000, 2),
+                     "profile": self.profile_name, "external": self.external}
             self.log.parent.mkdir(parents=True, exist_ok=True)
             with self.log.open("a", encoding="utf-8") as file:
                 file.write(encode(entry) + "\n")
@@ -140,10 +142,10 @@ def shorten(result, row, field, original, cap):
     row[field] = original[:low]
 
 
-def bounded(rows, cap, *, total=None, position=None):
+def bounded(rows, cap, *, total=None, position=None, metadata=None):
     if position is not None:
-        return search_page(rows, cap, total, position)
-    result = {"items": [], "has_more": False}
+        return search_page(rows, cap, total, position, metadata)
+    result = {"items": [], "has_more": False} | (metadata or {})
     for row in rows:
         result["items"].append(row)
         result["has_more"] = True
@@ -173,7 +175,7 @@ def bounded(rows, cap, *, total=None, position=None):
     return result
 
 
-def lexical_rows(db, where, params, query, *, word=False):
+def lexical_rows(db, where, params, query, *, word=False, external=False):
     joins = ""
     match = ""
     score = "0.0"
@@ -190,8 +192,11 @@ def lexical_rows(db, where, params, query, *, word=False):
         params = ['"' + tokens.replace('"', '""') + '"', *params]
     elif len(query) >= 3 and "\x00" not in query:
         joins = "JOIN words ON words.rowid=c.id"
-        score = "words.rank"
-        cte = "WITH words AS MATERIALIZED (SELECT rowid, rank FROM chunk_fts WHERE chunk_fts MATCH ?) "
+        # BM25 uses corpus-wide statistics, which would let hidden text affect the ranking.
+        if not external:
+            score = "words.rank"
+        fields = "rowid" if external else "rowid, rank"
+        cte = f"WITH words AS MATERIALIZED (SELECT {fields} FROM chunk_fts WHERE chunk_fts MATCH ?) "
         match = " AND contains_text(r.body, ?)"
         params = ['"' + query.replace('"', '""') + '"', *params, query]
     else:
@@ -200,6 +205,7 @@ def lexical_rows(db, where, params, query, *, word=False):
             match = " AND r.body LIKE ? ESCAPE '!'"
             params = [*params, literal_like(query)]
     separator = ", " if joins else ""
+    chunk_scope = " AND " + visible_chunk(external=True) if external else ""
     rows = db.execute(cte + separator + f"""
         eligible AS (
             SELECT c.id AS chunk, r.id AS record, r.created_at,
@@ -207,7 +213,7 @@ def lexical_rows(db, where, params, query, *, word=False):
                    row_number() OVER (PARTITION BY c.id ORDER BY {score}, r.created_at, r.id) AS ordinal
             FROM records r JOIN chunk_records cr ON cr.record_id=r.id
             JOIN chunks c ON c.id=cr.chunk_id {joins}
-            WHERE {where}{match}
+            WHERE {where}{match}{chunk_scope}
         )
         SELECT chunk, record FROM eligible WHERE ordinal=1
         ORDER BY score, created_at DESC, chunk DESC
@@ -215,9 +221,22 @@ def lexical_rows(db, where, params, query, *, word=False):
     return dict(rows)
 
 
+EXTERNAL_EVIDENCE = f"""
+    AND json_type(CASE WHEN json_valid(evidence_ids) THEN evidence_ids ELSE 'null' END)='array'
+    AND json_array_length(CASE WHEN json_valid(evidence_ids) THEN evidence_ids ELSE '[]' END)>0
+    AND NOT EXISTS (
+        SELECT 1 FROM json_each(CASE WHEN json_valid(evidence_ids) THEN evidence_ids ELSE '[]' END) evidence
+        WHERE evidence.type <> 'integer' OR NOT EXISTS (
+            SELECT 1 FROM records e WHERE e.id=evidence.value AND {visible_record("e", external=True)}
+        )
+    )
+"""
+
+
 class Query:
-    def __init__(self, config, embedder=None):
+    def __init__(self, config, embedder=None, *, profile_name=None, default_external=False):
         self.config = config
+        self.profile_name, self.external = profile(config, profile_name, default_external=default_external)
         self.embedder = embedder if embedder is not None else LocalEmbedder(config)
         self.database = Path(config["storage"]["database"])
         self.log = Path(config["storage"]["query_log"])
@@ -230,6 +249,13 @@ class Query:
         if self.limits["search"] < 180 or any(self.limits[name] < 128 for name in ("get", "count")):
             raise ValueError("Minimum response limits are 180 for search and 128 for get and count")
 
+    def metadata(self, db):
+        if self.external and db.execute("""
+            SELECT 1 FROM allow_list WHERE local_storage=1 AND external_ai=0 LIMIT 1
+        """).fetchone():
+            return {"withheld": True}
+        return {}
+
     @query_tool
     def search(self, db, query="", start=None, end=None, person=None, project=None, source=None,
                target=None, position=0, mode=None, *, _ranked=None):
@@ -237,14 +263,18 @@ class Query:
             target = "summary" if mode is None else "body"
         if target not in ("summary", "body") or not 0 <= position < 2**63:
             raise ValueError("Invalid search target or position")
-        if mode not in (None, "fts", "vector", "hybrid", "word") or (mode == "word" and _ranked is None):
+        if mode not in (None, "fts", "vector", "hybrid", "word") or (
+            mode == "word" and (_ranked is None or self.external)
+        ):
             raise ValueError("Invalid search mode")
-        where, params = filters(start, end, person, project, source)
-        metadata = {}
+        where, params = filters(start, end, person, project, source, external=self.external)
+        metadata = self.metadata(db)
+        sender = f"{RECORD_SENDER_NAME} AS person" if self.external else SENDER
         if target == "body":
             if mode in ("vector", "hybrid"):
-                key = vector_key(self.config)
-                eligible, unembedded = vector_rows(db, key, where, params)
+                eligible, unembedded, key = vector_rows(
+                    db, lambda: vector_key(self.config), where, params, external=self.external
+                )
                 ranked = cosine_rank(eligible, self.embedder, query, key) if eligible and query.strip() else {}
                 if not query.strip() or (not ranked and (eligible or unembedded)):
                     metadata["fallback"] = "fts"
@@ -254,7 +284,7 @@ class Query:
                     if unembedded:
                         metadata["unembedded"] = unembedded
             if mode != "vector":
-                lexical = lexical_rows(db, where, params, query, word=mode == "word")
+                lexical = lexical_rows(db, where, params, query, word=mode == "word", external=self.external)
                 ranked = fuse(lexical, ranked) if mode == "hybrid" else lexical
             total = len(ranked)
             ordered = list(ranked.items())[position:position + 10]
@@ -262,21 +292,22 @@ class Query:
             for chunk, record in ordered:
                 rows.append(db.execute(f"""
                     SELECT 'c:' || ? AS id, r.created_at AS datetime, r.source, r.original_ref,
-                           r.title, {SENDER}, r.body FROM records r WHERE r.id=?
+                           r.title, {sender}, r.body FROM records r WHERE r.id=?
                 """, (chunk, record)).fetchone())
         else:
             if mode in ("vector", "hybrid"):
                 metadata["fallback"] = "fts"
+            evidence = EXTERNAL_EVIDENCE if self.external else ""
             selection = f"""
                 WITH matching AS (
                     SELECT target_id, body, row_number() OVER (
                         PARTITION BY target_id ORDER BY generated_at DESC, id DESC
                     ) AS rank
                     FROM ai_extracted_items WHERE target_kind='record' AND state='valid'
-                      AND body LIKE ? ESCAPE '!'
+                      AND body LIKE ? ESCAPE '!' {evidence}
                 )
                 SELECT 'r:' || r.id AS id, r.created_at AS datetime, r.source, r.original_ref,
-                       r.title, {SENDER}, item.body AS body
+                       r.title, {sender}, item.body AS body
                 FROM matching item JOIN records r ON r.id=item.target_id
                 WHERE item.rank=1 AND {where}
             """
@@ -298,6 +329,7 @@ class Query:
         if not 1 <= len(ids) <= 5 or neighbors < 0:
             raise ValueError("Provide one to five IDs and a nonnegative neighbor count")
         cap = self.limits["get"]
+        visible = visible_record(external=self.external)
         rows = {}
         context = {}
         for identifier in ids:
@@ -308,14 +340,14 @@ class Query:
             if key >= 2**63:
                 raise ValueError("Invalid record or chunk ID")
             if prefix == "r":
-                item = db.execute(f"SELECT {RECORD} FROM records r WHERE r.id=? AND {VISIBLE}",
+                item = db.execute(f"SELECT {RECORD} FROM records r WHERE r.id=? AND {visible}",
                                   (key,)).fetchone()
             else:
                 item = db.execute(f"""
                     SELECT 'c:' || c.id AS id, c.starts_at AS datetime, r.source,
                            r.original_ref, r.title, c.body
                     FROM chunks c JOIN records r ON r.id=c.first_record_id
-                    WHERE c.id=? AND {VISIBLE}
+                    WHERE c.id=? AND {visible_chunk(external=self.external)}
                 """, (key,)).fetchone()
             if item is None:
                 continue
@@ -328,19 +360,20 @@ class Query:
                         edge AS (SELECT * FROM members ORDER BY created_at {edge_order}, id {edge_order} LIMIT 1)
                         SELECT {RECORD} FROM edge e JOIN records r
                             ON (r.source,r.account,r.channel_id)=(e.source,e.account,e.channel_id)
-                        WHERE {VISIBLE} AND (r.created_at,r.id) {op} (e.created_at,e.id)
+                        WHERE {visible} AND (r.created_at,r.id) {op} (e.created_at,e.id)
                         ORDER BY r.created_at {order}, r.id {order} LIMIT ?
                     """
                     for row in db.execute(neighbors_sql, (key, min(neighbors, cap))):
                         context.setdefault(row["id"], dict(row))
         rows.update((identifier, row) for identifier, row in context.items() if identifier not in rows)
-        return bounded(list(rows.values()), cap)
+        return bounded(list(rows.values()), cap, metadata=self.metadata(db))
 
     @query_tool
     def count(self, db, group_by, start=None, end=None, person=None, project=None, source=None):
+        person_label = f"min(CASE WHEN l.role='sender' THEN {RECORD_SENDER_NAME} END)" if self.external else "p.display_name"
         groups = {
             "month": ("substr(r.created_at,1,7)", "substr(r.created_at,1,7)", ""),
-            "person": ("p.id", "p.display_name", """JOIN record_person_links l ON l.record_id=r.id
+            "person": ("p.id", person_label, """JOIN record_person_links l ON l.record_id=r.id
                                                    JOIN persons p ON p.id=l.person_id"""),
             "project": ("p.id", "p.name", "LEFT JOIN projects p ON p.id=r.project_id"),
             "source": ("r.source", "r.source", ""),
@@ -348,13 +381,13 @@ class Query:
         if group_by not in groups:
             raise ValueError("Invalid count axis")
         key, label, join = groups[group_by]
-        where, params = filters(start, end, person, project, source)
+        where, params = filters(start, end, person, project, source, external=self.external)
         rows = [dict(row) for row in db.execute(f"""
             SELECT {key} AS key, {label} AS label, count(DISTINCT r.id) AS count
             FROM records r {join} WHERE {where}
             GROUP BY {key} ORDER BY {key} LIMIT 51
         """, params)]
-        result = bounded(rows[:50], self.limits["count"])
+        result = bounded(rows[:50], self.limits["count"], metadata=self.metadata(db))
         if len(rows) == 51:
             result["has_more"] = True
         return result

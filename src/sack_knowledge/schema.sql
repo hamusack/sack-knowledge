@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS record_person_links (
     record_id INTEGER NOT NULL REFERENCES records(id), person_id INTEGER NOT NULL REFERENCES persons(id),
     role TEXT NOT NULL, PRIMARY KEY(record_id, person_id, role)
 );
+CREATE TABLE IF NOT EXISTS record_sender_names (
+    record_id INTEGER PRIMARY KEY REFERENCES records(id),
+    display_name TEXT
+);
 CREATE TABLE IF NOT EXISTS record_relations (
     record_id INTEGER NOT NULL REFERENCES records(id), related_record_id INTEGER NOT NULL REFERENCES records(id),
     kind TEXT NOT NULL, PRIMARY KEY(record_id, related_record_id, kind)

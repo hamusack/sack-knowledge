@@ -11,6 +11,7 @@ from time import perf_counter
 from urllib.request import urlopen
 
 from .errors import LocalCommandError, ModelIntegrityError
+from .visibility import visible_chunk
 
 
 DEFAULT_MODEL = "cl-nagoya/ruri-v3-30m"
@@ -20,17 +21,6 @@ TOKENIZER_HASH = "0a94ac9a0a02c067bdef25b72ae9f4ee33f48f552e55988d444f6d25eeb1d0
 MAX_TOKENS = 8192
 QUERY_PREFIX = "検索クエリ: "
 PASSAGE_PREFIX = "検索文書: "
-
-
-def allowed_chunk(alias="c"):
-    return f"""EXISTS (
-        SELECT 1 FROM records anchor
-        WHERE anchor.id={alias}.first_record_id AND anchor.deleted=0
-          AND (anchor.source <> 'discord' OR EXISTS (
-              SELECT 1 FROM allow_list a
-              WHERE a.source=anchor.source AND a.target=anchor.account AND a.local_storage=1
-          ))
-    )"""
 
 
 def embedding_name(config):
@@ -213,7 +203,7 @@ def awaiting_embeddings(db, key):
     if key is not None and any(row[1] == "embedding_key" for row in db.execute("PRAGMA table_info(chunks)")):
         predicate = "(c.embedding IS NULL OR c.embedding_key IS NOT ?)"
         params = (key,)
-    return db.execute(f"SELECT count(*) FROM chunks c WHERE {allowed_chunk()} AND {predicate}", params).fetchone()[0]
+    return db.execute(f"SELECT count(*) FROM chunks c WHERE {visible_chunk()} AND {predicate}", params).fetchone()[0]
 
 
 def embed(config, embedder=None):
@@ -234,12 +224,12 @@ def embed(config, embedder=None):
                 db.execute("ALTER TABLE chunks ADD COLUMN embedding_dimension INTEGER")
             if not any(row[1] == "embedding_key" for row in db.execute("PRAGMA table_info(chunks)")):
                 db.execute("ALTER TABLE chunks ADD COLUMN embedding_key TEXT")
-        if prepare_files and db.execute(f"SELECT 1 FROM chunks c WHERE {allowed_chunk()} LIMIT 1").fetchone():
+        if prepare_files and db.execute(f"SELECT 1 FROM chunks c WHERE {visible_chunk()} LIMIT 1").fetchone():
             prepare_default_files(config)
         # Chunk IDs change on sync edits. Token-length sorting limits padding.
         rows = db.execute(f"""
             SELECT c.id, c.body FROM chunks c
-            WHERE (c.embedding IS NULL OR c.embedding_key IS NOT ?) AND {allowed_chunk()}
+            WHERE (c.embedding IS NULL OR c.embedding_key IS NOT ?) AND {visible_chunk()}
             ORDER BY c.id
         """, (key,)).fetchall()
         lengths = []
@@ -252,7 +242,7 @@ def embed(config, embedder=None):
             with db:
                 cursor = db.executemany(f"""
                     UPDATE chunks AS c SET embedding=?, embedding_model=?, embedding_dimension=?, embedding_key=?
-                    WHERE c.id=? AND (c.embedding IS NULL OR c.embedding_key IS NOT ?) AND {allowed_chunk()}
+                    WHERE c.id=? AND (c.embedding IS NULL OR c.embedding_key IS NOT ?) AND {visible_chunk()}
                 """, ((vector.tobytes(), name, len(vector), key, identifier, key)
                       for (identifier, _), vector in zip(batch, vectors, strict=True)))
                 embedded += cursor.rowcount
