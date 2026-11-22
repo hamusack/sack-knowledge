@@ -20,11 +20,14 @@ Discord records are keyed by source, guild and message ID. Times are UTC.
 An ID and fingerprint scan under a repeatable-read snapshot finds edits and
 deletions, including content edits without an edit timestamp. Only changed rows
 are fetched with their bodies. Discord remains the original source.
-An empty source snapshot or a loss exceeding both configured thresholds holds
-all deletions for that guild while upserts proceed. The CLI prints a count-only
+An empty source snapshot or a loss over 20% of the guild's live records,
+with at least five missing records by default, holds all missing IDs while
+upserts proceed. Each held ID stays held across syncs until it reappears or a
+sync explicitly confirms deletions. The CLI prints a count-only
 warning in its JSON output and returns a failure status. Use
 `sync discord --confirm-deletions` to apply deletions from the current snapshot.
-Sync can revoke the entire allow-list without connecting to PostgreSQL.
+Sync commits allow-list changes before connecting to PostgreSQL and can
+revoke the entire allow-list without connecting.
 Revoked guilds stay stored and all three tools omit them until sync re-allows them.
 Aliases are shared across guilds and the first nonempty author display name is
 kept. Mentions can create aliases before those people post.

@@ -96,55 +96,71 @@ def query_tool(function: Callable):
     return run
 
 
+def search_page(rows, cap, total, position):
+    def page(items):
+        next_position = position + len(items)
+        has_more = bool(items) and next_position < total
+        return {"items": items, "has_more": has_more, "total": total,
+                "next_position": next_position if has_more else None}
+
+    items = []
+    for row in rows:
+        candidate = [*items, row]
+        if len(encode(page(candidate))) <= cap:
+            items = candidate
+        elif items:
+            break
+        else:
+            date = row["datetime"].replace("+00:00", "Z").replace(".000000Z", "Z")
+            minimal = {"id": row["id"], "datetime": date, "excerpt": ""}
+            result = page([minimal])
+            shorten(result, minimal, "excerpt", row["excerpt"], cap)
+            return result
+    return page(items)
+
+
+def shorten(result, row, field, original, cap):
+    low, high = 0, min(len(original), cap)
+    while low < high:
+        middle = (low + high + 1) // 2
+        row[field] = original[:middle]
+        if len(encode(result)) <= cap:
+            low = middle
+        else:
+            high = middle - 1
+    row[field] = original[:low]
+
+
 def bounded(rows, cap, *, total=None, position=None):
+    if position is not None:
+        return search_page(rows, cap, total, position)
     result = {"items": [], "has_more": False}
-    if total is not None:
-        result["total"] = total
-        result["next_position"] = None
     for row in rows:
         result["items"].append(row)
         result["has_more"] = True
-        if position is not None:
-            result["next_position"] = position + len(result["items"])
         if len(encode(result)) <= cap:
             continue
         result["items"].pop()
-        field = "body" if "body" in row else "excerpt" if "excerpt" in row else None
+        field = "body" if "body" in row else None
         if field and not result["items"]:
             original = row[field]
-            if position is not None:
-                date = row["datetime"].replace("+00:00", "Z").replace(".000000Z", "Z")
-                row = {"id": row["id"], "datetime": date, "excerpt": ""}
-            else:
-                row[field] = ""
-                row["truncated"] = True
+            row[field] = ""
+            row["truncated"] = True
             result["items"].append(row)
             for optional in ("person", "title"):
                 if optional in row and len(encode(result)) > cap:
                     row[optional] = None
             if len(encode(result)) <= cap:
-                low, high = 0, min(len(original), cap)
-                while low < high:
-                    middle = (low + high + 1) // 2
-                    row[field] = original[:middle]
-                    if len(encode(result)) <= cap:
-                        low = middle
-                    else:
-                        high = middle - 1
-                row[field] = original[:low]
+                shorten(result, row, field, original, cap)
                 return result
             result["items"].pop()
         break
     returned = len(result["items"])
-    result["has_more"] = returned < len(rows) or (total is not None and (position or 0) + returned < total)
-    if position is not None:
-        result["next_position"] = position + returned if result["has_more"] else None
+    result["has_more"] = returned < len(rows)
     # The true/false and numeric/null variants can have different encoded lengths.
     while len(encode(result)) > cap and result["items"]:
         result["items"].pop()
         result["has_more"] = True
-        if position is not None:
-            result["next_position"] = position + len(result["items"])
     return result
 
 
@@ -190,13 +206,19 @@ class Query:
             """
         else:
             selection = f"""
+                WITH matching AS (
+                    SELECT target_id, body, row_number() OVER (
+                        PARTITION BY target_id ORDER BY generated_at DESC, id DESC
+                    ) AS rank
+                    FROM ai_extracted_items WHERE target_kind='record' AND state='valid'
+                      AND body LIKE ? ESCAPE '!'
+                )
                 SELECT 'r:' || r.id AS id, r.created_at AS datetime, r.source, r.original_ref,
                        r.title, {SENDER}, item.body AS body
-                FROM ai_extracted_items item JOIN records r ON r.id=item.target_id
-                WHERE item.target_kind='record' AND item.state='valid' AND {where}
-                  AND item.body LIKE ? ESCAPE '!'
+                FROM matching item JOIN records r ON r.id=item.target_id
+                WHERE item.rank=1 AND {where}
             """
-            params.append(literal_like(query))
+            params.insert(0, literal_like(query))
         total = db.execute(f"SELECT count(*) FROM ({selection})", params).fetchone()[0]
         rows = db.execute(selection + " ORDER BY datetime DESC, id DESC, body LIMIT 10 OFFSET ?",
                           [*params, position])

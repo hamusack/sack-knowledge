@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Create a read-only login role in the Discord collector's PostgreSQL.
 #
-# The password is generated here, written to local/secrets (git-ignored, 0600)
-# and sent to psql over stdin, so it never appears on a command line or in
-# this script's output.
+# The password is generated here and written to local/secrets (git-ignored, 0600).
+# Only its SCRAM verifier is sent to PostgreSQL, over stdin.
 #
 # Usage: create_discord_reader.sh <container> <admin_role> <database> <role>
 # The role may read only the two application tables granted below.
@@ -99,10 +98,31 @@ SELECT 1 / 0;
 SQL
 created=1
 
-# The generated password is hex. Keep all output from the password statement private.
-password="$(< "$temp")"
+verifier="$(python3 - "$temp" <<'PY'
+import base64
+import hashlib
+import hmac
+import secrets
+import sys
+from pathlib import Path
+
+# Hex passwords are ASCII and need no SASLprep normalization.
+password = Path(sys.argv[1]).read_bytes().rstrip(b"\n")
+salt = secrets.token_bytes(16)
+iterations = 4096
+salted = hashlib.pbkdf2_hmac("sha256", password, salt, iterations)
+client_key = hmac.digest(salted, b"Client Key", "sha256")
+stored_key = hashlib.sha256(client_key).digest()
+server_key = hmac.digest(salted, b"Server Key", "sha256")
+
+def encode(value):
+    return base64.b64encode(value).decode("ascii")
+
+print(f"SCRAM-SHA-256${iterations}:{encode(salt)}${encode(stored_key)}:{encode(server_key)}")
+PY
+)"
 if ! psql >/dev/null 2>&1 <<SQL
-ALTER ROLE :"reader_role" PASSWORD '$password';
+ALTER ROLE :"reader_role" PASSWORD '$verifier';
 SQL
 then
   echo "Could not set the role password." >&2

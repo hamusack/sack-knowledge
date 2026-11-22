@@ -12,7 +12,7 @@ guild_ids = ["<guild-id>"]
 gap_seconds = 300
 chunk_characters = 2400
 deletion_hold_fraction = 0.20
-deletion_hold_count = 50
+deletion_hold_count = 5
 
 [limits]
 search = 2000

@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS sync_state (
     source TEXT NOT NULL, account TEXT NOT NULL, token TEXT,
     last_success TEXT, last_error TEXT, PRIMARY KEY(source, account)
 );
+CREATE TABLE IF NOT EXISTS held_deletions (
+    record_id INTEGER PRIMARY KEY REFERENCES records(id)
+);
 CREATE TABLE IF NOT EXISTS allow_list (
     source TEXT NOT NULL, target TEXT NOT NULL, local_storage INTEGER NOT NULL,
     external_ai INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(source, target)

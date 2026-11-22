@@ -171,6 +171,76 @@ def test_bulk_deletion_hold_and_confirmation(setup, size, removed):
     assert result["deleted"] == removed and not result["deletions_held"]
 
 
+@pytest.mark.parametrize(("initial", "removed", "added"), [(100, 51, 160), (50, 49, 0)])
+def test_deletion_hold_survives_new_rows_and_clears_on_reappearance(setup, initial, removed, added):
+    config, source = setup
+    for key in range(initial):
+        source.add(str(key), key, "fixture")
+    sync(config, source.open)
+    original = source.rows["0"]
+    for key in range(removed):
+        del source.rows[str(key)]
+    for key in range(initial, initial + added):
+        source.add(str(key), key, "fixture")
+    result = sync(config, source.open)
+    assert result["inserted"] == added and result["deleted"] == 0
+    assert result["deletions_held"][0]["live_local"] == initial
+    assert result["deletions_held"][0]["missing"] == removed
+    result = sync(config, source.open)
+    assert result["inserted"] == result["deleted"] == 0
+    assert result["deletions_held"][0]["missing"] == removed
+    source.rows["0"] = original
+    result = sync(config, source.open)
+    assert result["deletions_held"][0]["missing"] == removed - 1
+    assert result["updated"] == 0
+    result = sync(config, source.open, confirm_deletions=True)
+    assert result["deleted"] == removed - 1 and not result["deletions_held"]
+    with closing(open_readonly(config["storage"]["database"])) as db:
+        assert db.execute("SELECT count(*) FROM held_deletions").fetchone()[0] == 0
+        assert db.execute("SELECT deleted FROM records WHERE source_id='0'").fetchone()[0] == 0
+
+
+def test_sync_cli_reports_held_and_passes_confirmation(setup, monkeypatch, capsys):
+    from sack_knowledge import __main__ as cli
+
+    config, source = setup
+    source.add("1", 0, "fixture")
+    sync(config, source.open)
+    source.rows.clear()
+    monkeypatch.setattr(cli, "load_config", lambda path: config)
+    monkeypatch.setattr(cli, "sync", lambda cfg, **options: sync(cfg, source.open, **options))
+    args = ["sack_knowledge", "sync", "discord"]
+    monkeypatch.setattr("sys.argv", args)
+    assert cli.main() == 1
+    assert json.loads(capsys.readouterr().out)["deletions_held"][0]["missing"] == 1
+    monkeypatch.setattr("sys.argv", [*args, "--confirm-deletions"])
+    assert cli.main() == 0
+    assert json.loads(capsys.readouterr().out)["deleted"] == 1
+
+
+def test_allow_list_revocation_survives_source_failure(setup):
+    config, source = setup
+    source.add("1", 0, "fixture")
+    sync(config, source.open)
+    query = Query(config)
+    chunk = query.search("fixture", target="body")["items"][0]["id"]
+    config["discord"]["guild_ids"] = ["2"]
+
+    @contextmanager
+    def fail(options):
+        with closing(open_readonly(config["storage"]["database"])) as db:
+            assert db.execute("SELECT target FROM allow_list WHERE local_storage=1").fetchone()[0] == "2"
+        raise RuntimeError("synthetic source failure")
+        yield
+
+    with pytest.raises(RuntimeError):
+        sync(config, fail)
+    assert query.search("fixture", target="body")["items"] == []
+    assert query.get(["r:1", chunk], neighbors=1)["items"] == []
+    assert query.count("source")["items"] == []
+    with closing(open_readonly(config["storage"]["database"])) as db:
+        assert db.execute("SELECT deleted FROM records").fetchone()[0] == 0
+
 def test_tight_search_cap_preserves_position(setup):
     config, source = setup
     for key in range(2):
@@ -190,6 +260,57 @@ def test_tight_search_cap_preserves_position(setup):
                         "excerpt": "A" * 100}], 180, total=max_id, position=max_id - 2)
     assert largest["items"][0]["id"] == f"c:{max_id}"
     assert largest["next_position"] == max_id - 1 and len(encode(largest)) <= 180
+
+
+def test_final_search_page_at_exact_cap():
+    row = {"id": "c:1", "datetime": "2025-01-01T00:00:00.123456+00:00",
+           "excerpt": "A" * 90, "title": ""}
+    expected = {"items": [row], "has_more": False, "total": 1, "next_position": None}
+    row["title"] = "X" * (500 - len(encode(expected)))
+    assert len(encode(expected)) == 500
+    assert bounded([row], 500, total=1, position=0) == expected
+    compact = bounded([row], 499, total=1, position=0)
+    assert [item["id"] for item in compact["items"]] == ["c:1"]
+    assert not compact["has_more"] and compact["next_position"] is None
+
+
+@pytest.mark.parametrize("cap", [180, 250, 500, 900, 2000])
+def test_search_pages_return_every_id_once(setup, cap):
+    config, source = setup
+    for key in range(23):
+        source.add(str(key), key * 10, "fixture " * 12)
+        source.rows[str(key)]["title"] = "X" * (10 * key)
+    sync(config, source.open)
+    config["limits"]["search"] = cap
+    query = Query(config)
+    seen = []
+    position = 0
+    for _ in range(23):
+        result = query.search("fixture", target="body", position=position)
+        assert len(encode(result)) <= cap
+        assert result["items"]
+        seen.extend(item["id"] for item in result["items"])
+        if not result["has_more"]:
+            break
+        assert result["next_position"] == len(seen)
+        position = result["next_position"]
+    else:
+        pytest.fail("Pagination did not terminate")
+    assert sorted(seen) == sorted(f"c:{index}" for index in range(1, 24))
+
+
+def test_summary_search_returns_one_result_per_record(setup):
+    config, source = setup
+    source.add("1", 0, "fixture")
+    sync(config, source.open)
+    with sqlite3.connect(config["storage"]["database"]) as db:
+        db.executemany("""
+            INSERT INTO ai_extracted_items(target_kind, target_id, body, evidence_ids, model, generated_at, state)
+            VALUES ('record', 1, ?, '[1]', 'fixture', ?, 'valid')
+        """, [("older fixture", "2025-01-01"), ("newer fixture", "2025-01-02")])
+    result = Query(config).search("fixture")
+    assert result["total"] == 1
+    assert result["items"][0]["excerpt"] == "newer fixture"
 
 
 @pytest.mark.parametrize("term", ['"abc"', "aaa OR bbb", "NEAR(aaa bbb)", "body:aaa"])
