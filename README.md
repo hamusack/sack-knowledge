@@ -2,7 +2,24 @@
 
 個人活動のナレッジ基盤を置くプロジェクトです。副業と個人活動のメール、会議、予定、Discordの記録をローカルへ集約し、Agent Hubと将来のAI秘書が同じ窓口から検索します。本業のデータは取り込みません。
 
-2026-11-23時点では設計とDiscordの既存DBの確認が済んでおり、実装とデータ取り込みは始めていません。
+Discordの既存DBからSQLiteに発言を取り込み、CLIとMCPで検索、取得、集計できます。
+
+## Discordの同期と検索を始める
+
+リポジトリのルートで次のコマンドを実行します。設定をコピーしたら、`local/config.toml`に読み取り専用の接続情報、パスワードファイルのパス、取り込むGuildのIDを記入します。
+
+同期を実行するには、ホストのDockerを操作でき、コンテナのアドレスのTCPポート5432に接続できる必要があります。
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+mkdir -p local
+cp config.example.toml local/config.toml
+.venv/bin/python -m sack_knowledge sync discord
+.venv/bin/python -m sack_knowledge search --target body '<検索語>'
+```
+
+MCPクライアントには、作業ディレクトリをリポジトリのルートに設定し、起動コマンドとして`.venv/bin/python -m sack_knowledge mcp`を指定します。
 
 ## 公開する範囲
 
@@ -182,6 +199,10 @@ DBの候補はSQLiteとDuckDBです。どちらも1つのファイルで全文�
 - 1問あたりに返した文字数
 
 比べる方式は3文字単位の全文検索、単語で区切る全文検索、ベクトル検索、全文検索とベクトル検索の合成です。
+
+埋め込みの既定には、Apache 2.0のRuri v3 30mを使います。公開モデルカードのJMTEB検索スコアは、3,700万パラメータの30mが78.08、7,000万パラメータの70mが79.96です。入力の既定の上限はモデルと同じ8,192トークンです。上限を超える入力は分割し、全体から256次元のベクトルを作ります。[モデルカードと評価結果](https://huggingface.co/cl-nagoya/ruri-v3-30m)、[ONNX版](https://huggingface.co/kens24481/ruri-v3-30m-onnx)
+
+`pip install -e '.[search]'`で検索用の依存関係を追加し、`python -m sack_knowledge embed`で埋め込みを作ります。本文検索の既定は3文字単位の全文検索です。`search --mode vector`でベクトル検索、`search --mode hybrid`で順位を合成した検索に切り替えます。比較するには、`local/config.toml`で`evaluation.word_index = true`を設定し、質問を`local/questions.jsonl`に置いて`python -m sack_knowledge eval`を実行します。
 
 ## 未決事項
 

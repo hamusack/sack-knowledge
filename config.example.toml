@@ -1,0 +1,34 @@
+[storage]
+database = "local/data/knowledge.sqlite3"
+query_log = "local/data/queries.jsonl"
+
+[discord]
+container = "<container>"
+network = "<network>"
+database = "<database>"
+role = "<read-only-role>"
+password_file = "local/secrets/<password-file>"
+guild_ids = ["<guild-id>"]
+gap_seconds = 300
+chunk_characters = 2400
+deletion_hold_fraction = 0.20
+deletion_hold_count = 5
+
+[embedding]
+model = "cl-nagoya/ruri-v3-30m"
+cache = "local/models"
+max_tokens = 8192
+threads = 8
+batch_size = 32
+# For another compatible ONNX export, set model, model_path, tokenizer_path,
+# query_prefix and passage_prefix. The graph must return token embeddings.
+
+[evaluation]
+word_index = false
+# JSONL under local/: {"question": "...", "answers": ["r:1", "c:2"], "filters": {"source": "discord"}}
+# Filters may contain start, end, person, project or source.
+
+[limits]
+search = 2000
+get = 6000
+count = 2000
