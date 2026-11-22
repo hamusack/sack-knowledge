@@ -39,7 +39,8 @@ def main():
     options = vars(parser.parse_args())
     command = options.pop("command")
     try:
-        config = load_config(options.pop("config"))
+        config_path = options.pop("config")
+        config = load_config(config_path)
         if command == "mcp":
             from .mcp_server import server
 
@@ -58,7 +59,7 @@ def main():
         elif command == "backup":
             from .backup import backup
 
-            result = backup(config, mode=options["mode"] or "backup")
+            result = backup(config, mode=options["mode"] or "backup", config_path=config_path)
         elif command == "eval":
             from .evaluation import evaluate, table
 

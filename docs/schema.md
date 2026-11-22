@@ -89,3 +89,8 @@ response payload.
 Scheduled refresh uses a local nonblocking lock. The sync state entry for
 `refresh` records only a phase and exception type on failure. Deletion holds
 remain in the per-source sync state and do not fail the refresh process.
+
+Backup retention and verification use the backup tag, the source root, and a
+host label derived from the machine ID. Snapshots made before host scoping
+were introduced are retained separately and require explicit selection for
+manual recovery. The managed snapshot count covers this source only.
