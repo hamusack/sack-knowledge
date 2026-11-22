@@ -2,7 +2,24 @@
 
 個人活動のナレッジ基盤を置くプロジェクトです。副業と個人活動のメール、会議、予定、Discordの記録をローカルへ集約し、Agent Hubと将来のAI秘書が同じ窓口から検索します。本業のデータは取り込みません。
 
-2026-11-23時点では設計とDiscordの既存DBの確認が済んでおり、実装とデータ取り込みは始めていません。
+Discordの既存DBからSQLiteに発言を取り込み、CLIとMCPで検索、取得、集計できます。
+
+## Discordの同期と検索を始める
+
+リポジトリのルートで次のコマンドを実行します。設定をコピーしたら、`local/config.toml`に読み取り専用の接続情報、パスワードファイルのパス、取り込むGuildのIDを記入します。
+
+同期を実行するには、ホストのDockerを操作でき、コンテナのアドレスのTCPポート5432に接続できる必要があります。
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+mkdir -p local
+cp config.example.toml local/config.toml
+.venv/bin/python -m sack_knowledge sync discord
+.venv/bin/python -m sack_knowledge search --target body '<検索語>'
+```
+
+MCPクライアントには、作業ディレクトリをリポジトリのルートに設定し、起動コマンドとして`.venv/bin/python -m sack_knowledge mcp`を指定します。
 
 ## 公開する範囲
 

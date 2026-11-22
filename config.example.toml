@@ -1,0 +1,20 @@
+[storage]
+database = "local/data/knowledge.sqlite3"
+query_log = "local/data/queries.jsonl"
+
+[discord]
+container = "<container>"
+network = "<network>"
+database = "<database>"
+role = "<read-only-role>"
+password_file = "local/secrets/<password-file>"
+guild_ids = ["<guild-id>"]
+gap_seconds = 300
+chunk_characters = 2400
+deletion_hold_fraction = 0.20
+deletion_hold_count = 5
+
+[limits]
+search = 2000
+get = 6000
+count = 2000
