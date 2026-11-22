@@ -192,11 +192,8 @@ def lexical_rows(db, where, params, query, *, word=False, external=False):
         params = ['"' + tokens.replace('"', '""') + '"', *params]
     elif len(query) >= 3 and "\x00" not in query:
         joins = "JOIN words ON words.rowid=c.id"
-        # BM25 uses corpus-wide statistics, which would let hidden text affect the ranking.
-        if not external:
-            score = "words.rank"
-        fields = "rowid" if external else "rowid, rank"
-        cte = f"WITH words AS MATERIALIZED (SELECT {fields} FROM chunk_fts WHERE chunk_fts MATCH ?) "
+        score = "words.rank"
+        cte = "WITH words AS MATERIALIZED (SELECT rowid, rank FROM chunk_fts WHERE chunk_fts MATCH ?) "
         match = " AND contains_text(r.body, ?)"
         params = ['"' + query.replace('"', '""') + '"', *params, query]
     else:

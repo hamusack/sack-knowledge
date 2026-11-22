@@ -101,7 +101,7 @@ effective profile and external flag. The external policy reads committed
 permissions on each call and requires clearance for all chunk members and
 summary evidence. A query-independent `withheld` flag indicates that at least
 one locally enabled source disallows external AI; it discloses no match count.
-External FTS orders visible matches by date, since index-wide BM25 scores can
-change when hidden data changes. External sender names come from the visible
+Shared FTS term statistics can let withheld data indirectly change the relevance order of visible results.
+External sender names come from the visible
 records themselves. The first sync after upgrade backfills these names from
 source metadata for existing records. Evaluation runs locally.

@@ -86,6 +86,19 @@ def test_external_pages_and_totals_only_include_cleared_chunks(corpus, mode):
     assert local["total"] >= 4 and "withheld" not in local
 
 
+def test_external_fts_matches_local_relevance_order_when_all_entries_are_cleared(corpus):
+    config, source, _ = corpus
+    config["discord"]["external_ai"] = {"1": True, "2": True}
+    config["limits"]["search"] = 2000
+    source.rows["1"]["10"]["body"] = "fixture fixture fixture fixture"
+    sync(config, source.open)
+    local = Query(config).search("fixture", mode="fts")
+    external = Query(config, profile_name="remote").search("fixture", mode="fts")
+    order = [row["id"] for row in local["items"]]
+    assert local == external and len(order) == 4
+    assert order[0] == Query(config).search("fixture fixture", mode="fts")["items"][0]["id"]
+
+
 def test_external_fallback_and_pending_count_only_use_cleared_chunks(corpus):
     config, source, model = corpus
     source.add("2", "22", 60, "4")
