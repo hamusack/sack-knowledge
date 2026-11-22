@@ -2,7 +2,28 @@
 
 個人活動のナレッジ基盤を置くプロジェクトです。副業と個人活動のメール、会議、予定、Discordの記録をローカルへ集約し、Agent Hubと将来のAI秘書が同じ窓口から検索します。本業のデータは取り込みません。
 
-2026-11-23時点では設計とDiscordの既存DBの確認が済んでおり、実装とデータ取り込みは始めていません。
+Discordの既存DBからSQLiteに発言を取り込み、CLIとMCPで検索、取得、集計できます。
+
+## Discordの同期と検索を始める
+
+リポジトリのルートで次のコマンドを実行します。設定をコピーしたら、`local/config.toml`に読み取り専用の接続情報、パスワードファイルのパス、取り込むGuildのIDを記入します。
+
+同期を実行するには、ホストのDockerを操作でき、コンテナのアドレスのTCPポート5432に接続できる必要があります。
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+mkdir -p local
+cp config.example.toml local/config.toml
+.venv/bin/python -m sack_knowledge sync discord
+.venv/bin/python -m sack_knowledge search --target body '<検索語>'
+```
+
+MCPクライアントには、作業ディレクトリをリポジトリのルートに設定し、起動コマンドとして`.venv/bin/python -m sack_knowledge mcp`を指定します。
+
+`.venv/bin/python -m sack_knowledge refresh`で、設定済みの取得元を同期し、埋め込み待ちのまとまりを処理します。終了コードは、成功、削除保留、別の実行が進行中の場合は0、処理に失敗した場合は1です。失敗は同期の状態に記録し、次の実行でやり直します。
+
+`python3 scripts/install_systemd.py`でユーザー用のタイマーを登録します。同期は15分ごと、バックアップは1日1回の予定時刻から、少しずらして実行します。登録を解除するコマンドは`python3 scripts/uninstall_systemd.py`です。
 
 ## 公開する範囲
 
@@ -88,7 +109,11 @@ GmailとGoogleカレンダーの対象は4つのアカウントです。アド�
 
 Discordの発言の原本は既存の収集BotのPostgreSQLにあり、この基盤のバックアップには含めません。
 
-NAS上の保存場所、暗号化の方法、保存の頻度は決めていません。
+NAS上の保存先は`local/config.toml`で指定します。保存するSQLiteは、オンラインバックアップで作ったコピーです。resticで暗号化し、稼働中のDBファイル、一時ファイル、モデルのキャッシュを除外します。バックアップは毎日実行し、日次7世代、週次4世代、月次12世代を保持します。
+
+初回は`.venv/bin/python -m sack_knowledge backup --init`で保存先を初期化します。復元には、このとき作るパスワードファイルが必要です。バックアップ先とは別の場所に、そのファイルのコピーを保管してください。
+
+手動で保存するには`.venv/bin/python -m sack_knowledge backup`を実行します。`backup --verify`は最新のバックアップを一時ディレクトリに復元し、SQLiteの整合性を確認してから、記録数とまとまり数を稼働中のDBと比較します。件数が異なる場合の終了コードは1です。
 
 ## 取得元ごとの差分同期
 
@@ -183,14 +208,17 @@ DBの候補はSQLiteとDuckDBです。どちらも1つのファイルで全文�
 
 比べる方式は3文字単位の全文検索、単語で区切る全文検索、ベクトル検索、全文検索とベクトル検索の合成です。
 
+埋め込みの既定には、Apache 2.0のRuri v3 30mを使います。公開モデルカードのJMTEB検索スコアは、3,700万パラメータの30mが78.08、7,000万パラメータの70mが79.96です。入力の既定の上限はモデルと同じ8,192トークンです。上限を超える入力は分割し、全体から256次元のベクトルを作ります。[モデルカードと評価結果](https://huggingface.co/cl-nagoya/ruri-v3-30m)、[ONNX版](https://huggingface.co/kens24481/ruri-v3-30m-onnx)
+
+`pip install -e '.[search]'`で検索用の依存関係を追加し、`python -m sack_knowledge embed`で埋め込みを作ります。本文検索の既定は3文字単位の全文検索です。`search --mode vector`でベクトル検索、`search --mode hybrid`で順位を合成した検索に切り替えます。比較するには、`local/config.toml`で`evaluation.word_index = true`を設定し、質問を`local/questions.jsonl`に置いて`python -m sack_knowledge eval`を実行します。
+
 ## 未決事項
 
 - Discordの読み取り専用ロールの作成と、DBへの接続の経路。
 - 検索方式を比べるための30問の質問。
 - Discordの範囲と、取り込む期間。
 - 外部AIを使う呼び出し元の見分け方。Discordには他の参加者の発言が含まれます。
-- NAS上のバックアップの保存場所、暗号化の方法、保存の頻度。
-- 常時動かす機器と同期の頻度。
+- 常時動かす機器。
 - DB、日本語の全文検索方式、埋め込みモデル。
 
 ## 禁止事項
