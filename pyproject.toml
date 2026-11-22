@@ -1,0 +1,11 @@
+[project]
+name = "sack-knowledge"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["psycopg[binary]>=3.3,<4", "mcp>=1.20,<2"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.setuptools.package-data]
+sack_knowledge = ["schema.sql"]
