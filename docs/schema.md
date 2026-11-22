@@ -3,7 +3,7 @@
 | README term | SQLite table |
 |---|---|
 | 記録 | `records` |
-| まとまり | `chunks`, `chunk_records` |
+| チャンク | `chunks`, `chunk_records` |
 | 人物 | `persons` |
 | 人物の別名 | `person_aliases` |
 | 案件 | `projects` |
